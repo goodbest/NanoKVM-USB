@@ -22,6 +22,7 @@ const zh = {
     },
     video: {
       resolution: '分辨率',
+      frameRate: '帧率',
       scale: '缩放',
       auto: '自动',
       rotation: '旋转',

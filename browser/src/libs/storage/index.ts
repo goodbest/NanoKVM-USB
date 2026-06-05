@@ -1,10 +1,11 @@
-import type { Resolution, Rotation } from '@/types';
+import type { Resolution, Rotation, VideoFrameRate } from '@/types';
 
 const LANGUAGE_KEY = 'nanokvm-usb-language';
 const VIDEO_DEVICE_ID_KEY = 'nanokvm-usb-video-device-id';
 const VIDEO_RESOLUTION_KEY = 'nanokvm-usb-video-resolution';
 const CUSTOM_RESOLUTION_KEY = 'nanokvm-usb-custom-resolution';
 const VIDEO_SCALE_KEY = 'nanokvm-usb-video-scale';
+const VIDEO_FRAME_RATE_KEY = 'nanokvm-usb-video-frame-rate';
 const VIDEO_ROTATION_KEY = 'nanokvm-usb-video-rotation';
 const IS_MENU_OPEN_KEY = 'nanokvm-is-menu-open';
 const MOUSE_STYLE_KEY = 'nanokvm-usb-mouse-style';
@@ -70,6 +71,24 @@ export function getVideoScale(): number | null {
 
 export function setVideoScale(scale: number): void {
   localStorage.setItem(VIDEO_SCALE_KEY, String(scale));
+}
+
+export function getVideoFrameRate(): VideoFrameRate | null {
+  const frameRate = localStorage.getItem(VIDEO_FRAME_RATE_KEY);
+  if (frameRate === 'auto') {
+    return frameRate;
+  }
+
+  const value = Number(frameRate);
+  if (value === 60 || value === 50 || value === 30 || value === 25) {
+    return value;
+  }
+
+  return null;
+}
+
+export function setVideoFrameRate(frameRate: VideoFrameRate): void {
+  localStorage.setItem(VIDEO_FRAME_RATE_KEY, String(frameRate));
 }
 
 export function getVideoRotation(): Rotation | null {

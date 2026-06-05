@@ -8,6 +8,7 @@ export function registerSerialPort(): void {
   ipcMain.handle(IpcEvents.GET_SERIAL_PORTS, getSerialPorts)
   ipcMain.handle(IpcEvents.OPEN_SERIAL_PORT, openSerialPort)
   ipcMain.handle(IpcEvents.CLOSE_SERIAL_PORT, closeSerialPort)
+  ipcMain.handle(IpcEvents.GET_DEVICE_INFO, getDeviceInfo)
   ipcMain.handle(IpcEvents.SEND_KEYBOARD, sendKeyboard)
   ipcMain.handle(IpcEvents.SEND_MOUSE, sendMouse)
 }
@@ -60,6 +61,23 @@ async function closeSerialPort(): Promise<boolean> {
   } catch (error) {
     console.error('Error closing serial port:', error)
     return false
+  }
+}
+
+async function getDeviceInfo(): Promise<Record<string, unknown>> {
+  try {
+    const info = await device.getInfo()
+    return {
+      chipVersion: info.CHIP_VERSION,
+      isConnected: info.IS_CONNECTED,
+      numLock: info.NUM_LOCK,
+      capsLock: info.CAPS_LOCK,
+      scrollLock: info.SCROLL_LOCK
+    }
+  } catch (error) {
+    console.error('Error getting device info:', error)
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error'
+    return { error: errorMsg }
   }
 }
 

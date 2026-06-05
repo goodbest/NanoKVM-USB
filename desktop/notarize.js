@@ -6,6 +6,15 @@ exports.default = async function notarizing(context) {
     return
   }
 
+  if (
+    !process.env.APPLE_TEAM_ID ||
+    !process.env.APPLE_ID ||
+    !process.env.APPLE_APP_SPECIFIC_PASSWORD
+  ) {
+    console.log('Skipping macOS notarization: Apple credentials are not configured.')
+    return
+  }
+
   const appName = context.packager.appInfo.productFilename
 
   return await notarize({

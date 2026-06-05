@@ -14,6 +14,8 @@ import { VirtualKeyboard } from '@renderer/components/virtual-keyboard'
 import {
   resolutionAtom,
   serialPortStateAtom,
+  videoColorAtom,
+  videoFrameRateAtom,
   videoScaleAtom,
   videoStateAtom
 } from '@renderer/jotai/device'
@@ -21,8 +23,7 @@ import { isKeyboardEnableAtom } from '@renderer/jotai/keyboard'
 import { mouseModeAtom, mouseStyleAtom } from '@renderer/jotai/mouse'
 import { camera } from '@renderer/libs/media/camera'
 import { requestCameraPermission } from '@renderer/libs/media/permission'
-import { getVideoResolution } from '@renderer/libs/storage'
-import type { Resolution } from '@renderer/types'
+import { getVideoColor, getVideoFrameRate, getVideoResolution } from '@renderer/libs/storage'
 
 type State = 'loading' | 'success' | 'failed'
 
@@ -31,41 +32,60 @@ const App = (): ReactElement => {
   const isBigScreen = useMediaQuery({ minWidth: 850 })
 
   const videoScale = useAtomValue(videoScaleAtom)
+  const videoColor = useAtomValue(videoColorAtom)
   const videoState = useAtomValue(videoStateAtom)
   const serialPortState = useAtomValue(serialPortStateAtom)
   const mouseMode = useAtomValue(mouseModeAtom)
   const mouseStyle = useAtomValue(mouseStyleAtom)
   const isKeyboardEnable = useAtomValue(isKeyboardEnableAtom)
   const setResolution = useSetAtom(resolutionAtom)
+  const setVideoColor = useSetAtom(videoColorAtom)
+  const setVideoFrameRate = useSetAtom(videoFrameRateAtom)
 
   const [state, setState] = useState<State>('loading')
+  const colorFilter = [
+    `brightness(${videoColor.brightness})`,
+    `contrast(${videoColor.contrast})`,
+    `saturate(${videoColor.saturation})`
+  ].join(' ')
 
   useEffect(() => {
     const resolution = getVideoResolution()
     if (resolution) {
       setResolution(resolution)
     }
+    const frameRate = getVideoFrameRate()
+    if (frameRate) {
+      setVideoFrameRate(frameRate)
+    }
+    const color = getVideoColor()
+    if (color) {
+      setVideoColor(color)
+    }
 
-    requestMediaPermissions(resolution)
+    async function requestMediaPermissions(): Promise<void> {
+      try {
+        const granted = await requestCameraPermission(resolution)
+        setState(granted ? 'success' : 'failed')
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          ['NotAllowedError', 'PermissionDeniedError'].includes(err.name)
+        ) {
+          setState('failed')
+        } else {
+          setState('success')
+        }
+      }
+    }
+
+    requestMediaPermissions()
 
     return (): void => {
       camera.close()
       window.electron.ipcRenderer.invoke(IpcEvents.CLOSE_SERIAL_PORT)
     }
-  }, [])
-
-  async function requestMediaPermissions(resolution?: Resolution): Promise<void> {
-    try {
-      const granted = await requestCameraPermission(resolution)
-      setState(granted ? 'success' : 'failed')
-    } catch (err) {
-      if (err instanceof Error && ['NotAllowedError', 'PermissionDeniedError'].includes(err.name)) {
-        setState('failed')
-      } else {
-        setState('success')
-      }
-    }
-  }
+  }, [setResolution, setVideoColor, setVideoFrameRate])
 
   if (state === 'loading') {
     return <Spin size="large" spinning={true} tip={t('camera.tip')} fullscreen />
@@ -104,7 +124,10 @@ const App = (): ReactElement => {
           videoState === 'connected' ? 'opacity-100' : 'opacity-0',
           mouseMode === 'relative' ? 'cursor-none' : mouseStyle
         )}
-        style={{ transform: `scale(${videoScale})` }}
+        style={{
+          filter: colorFilter,
+          transform: `scale(${videoScale})`
+        }}
         autoPlay
         playsInline
       />

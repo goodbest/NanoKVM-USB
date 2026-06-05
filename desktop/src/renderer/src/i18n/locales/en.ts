@@ -26,6 +26,16 @@ const en = {
     },
     video: {
       resolution: 'Resolution',
+      frameRate: 'FPS',
+      auto: 'Auto',
+      color: 'Color',
+      colorControls: {
+        brightness: 'Brightness',
+        contrast: 'Contrast',
+        saturation: 'Saturation',
+        reset: 'Reset',
+        rangeExpand: 'Range expand'
+      },
       scale: 'Scale',
       customResolution: 'Custom',
       device: 'Device',

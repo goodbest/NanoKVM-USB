@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { MouseRelativeEvent } from '@/components/mouse/types.ts';
 import { scrollDirectionAtom, scrollIntervalAtom } from '@/jotai/mouse.ts';
 import { device } from '@/libs/device';
+import { recordMouseEvent } from '@/libs/diagnostics/runtime.ts';
 import { MouseReportRelative } from '@/libs/mouse';
 import { mouseJiggler } from '@/libs/mouse-jiggler';
 
@@ -46,12 +47,14 @@ export const Relative = () => {
     // Mouse down event
     function handleMouseDown(e: MouseEvent): void {
       disableEvent(e);
+      recordMouseEvent('button');
       handleMouseEvent({ type: 'mousedown', button: e.button });
     }
 
     // Mouse up event
     function handleMouseUp(e: MouseEvent): void {
       disableEvent(e);
+      recordMouseEvent('button');
       handleMouseEvent({ type: 'mouseup', button: e.button });
     }
 
@@ -66,6 +69,7 @@ export const Relative = () => {
       const deltaX = Math.abs(x * window.devicePixelRatio) < 10 ? x * 2 : x;
       const deltaY = Math.abs(y * window.devicePixelRatio) < 10 ? y * 2 : y;
 
+      recordMouseEvent('move');
       handleMouseEvent({ type: 'move', deltaX, deltaY });
     }
 
@@ -83,6 +87,7 @@ export const Relative = () => {
       }
 
       const deltaY = (e.deltaY > 0 ? 1 : -1) * scrollDirection;
+      recordMouseEvent('wheel');
       handleMouseEvent({ type: 'wheel', deltaY });
       lastScrollTimeRef.current = currentTime;
     }

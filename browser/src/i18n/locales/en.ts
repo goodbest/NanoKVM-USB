@@ -24,6 +24,7 @@ const en = {
     },
     video: {
       resolution: 'Resolution',
+      frameRate: 'Frame rate',
       scale: 'Scale',
       auto: "Auto",
       rotation: 'Rotation',

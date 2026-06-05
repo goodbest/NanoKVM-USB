@@ -13,6 +13,7 @@ import { VirtualKeyboard } from '@/components/virtual-keyboard';
 import {
   resolutionAtom,
   serialStateAtom,
+  videoFrameRateAtom,
   videoRotationAtom,
   videoScaleAtom,
   videoStateAtom
@@ -35,6 +36,7 @@ const App = () => {
   const serialState = useAtomValue(serialStateAtom);
   const isKeyboardEnable = useAtomValue(isKeyboardEnableAtom);
   const setResolution = useSetAtom(resolutionAtom);
+  const setVideoFrameRate = useSetAtom(videoFrameRateAtom);
   const [videoRotation, setVideoRotation] = useAtom(videoRotationAtom);
 
   const [isLoading, setIsLoading] = useState(true);
@@ -43,6 +45,7 @@ const App = () => {
 
   useEffect(() => {
     initResolution();
+    initFrameRate();
     initRotation();
 
     return () => {
@@ -92,6 +95,13 @@ const App = () => {
     const rotation = storage.getVideoRotation();
     if (rotation) {
       setVideoRotation(rotation);
+    }
+  }
+
+  function initFrameRate() {
+    const frameRate = storage.getVideoFrameRate();
+    if (frameRate) {
+      setVideoFrameRate(frameRate);
     }
   }
 

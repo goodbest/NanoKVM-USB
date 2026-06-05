@@ -1,5 +1,6 @@
 import { CmdEvent, CmdPacket, InfoPacket } from './proto.ts';
 import { SerialPort } from './serial-port.ts';
+import { recordMouseReport } from '@/libs/diagnostics/runtime.ts';
 
 export class Device {
   addr: number;
@@ -30,6 +31,7 @@ export class Device {
     const cmdEvent = report[0] === 0x01 ? CmdEvent.SEND_MS_REL_DATA : CmdEvent.SEND_MS_ABS_DATA;
     const cmdData = new CmdPacket(this.addr, cmdEvent, report).encode();
     await this.serialPort.write(cmdData);
+    recordMouseReport();
   }
 }
 

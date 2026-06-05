@@ -2,6 +2,7 @@ import { Popover } from 'antd';
 import { MonitorIcon } from 'lucide-react';
 
 import { Device } from './device.tsx';
+import { FrameRate } from './frame-rate.tsx';
 import { Resolution } from './resolution.tsx';
 import { Rotation } from './rotation.tsx';
 import { Scale } from './scale.tsx';
@@ -10,6 +11,7 @@ export const Video = () => {
   const content = (
     <div className="flex flex-col space-y-0.5">
       <Resolution />
+      <FrameRate />
       <Rotation />
       <Scale />
       <Device />

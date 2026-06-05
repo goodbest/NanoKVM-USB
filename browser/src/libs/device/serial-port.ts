@@ -1,4 +1,5 @@
 import { isDisconnectError, raceWithTimeout } from './utils';
+import { recordSerialError, recordSerialWrite } from '@/libs/diagnostics/runtime.ts';
 
 type WebSerialPort = {
   open: (options: { baudRate: number }) => Promise<void>;
@@ -100,9 +101,12 @@ export class SerialPort {
       throw new Error('Serial port not initialized');
     }
 
+    const startTime = performance.now();
     try {
       await this.writer.write(new Uint8Array(data));
+      recordSerialWrite(performance.now() - startTime);
     } catch (err) {
+      recordSerialError(err);
       if (isDisconnectError(err)) {
         this.handleDisconnect();
         throw new Error('Device disconnected');

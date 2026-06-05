@@ -4,6 +4,12 @@ import { useMediaQuery } from 'react-responsive'
 
 import { IpcEvents } from '@common/ipc-events'
 import { scrollDirectionAtom, scrollIntervalAtom } from '@renderer/jotai/mouse'
+import {
+  recordMouseEvent,
+  recordMouseReport,
+  recordSerialError,
+  recordSerialWrite
+} from '@renderer/libs/diagnostics/runtime'
 import { MouseAbsoluteRelative } from '@renderer/libs/mouse'
 import { mouseJiggler } from '@renderer/libs/mouse-jiggler'
 
@@ -90,7 +96,14 @@ export const Absolute = (): ReactElement => {
           break
       }
 
-      window.electron.ipcRenderer.invoke(IpcEvents.SEND_MOUSE, [0x02, ...report])
+      const startTime = performance.now()
+      window.electron.ipcRenderer
+        .invoke(IpcEvents.SEND_MOUSE, [0x02, ...report])
+        .then(() => {
+          recordSerialWrite(performance.now() - startTime)
+          recordMouseReport()
+        })
+        .catch(recordSerialError)
 
       mouseJiggler.moveEventCallback()
     }
@@ -98,18 +111,21 @@ export const Absolute = (): ReactElement => {
     // Mouse down event
     function handleMouseDown(e: MouseEvent): void {
       disableEvent(e)
+      recordMouseEvent('button')
       handleMouseEvent({ type: 'mousedown', button: e.button })
     }
 
     // Mouse up event
     function handleMouseUp(e: MouseEvent): void {
       disableEvent(e)
+      recordMouseEvent('button')
       handleMouseEvent({ type: 'mouseup', button: e.button })
     }
 
     // Mouse move event
     function handleMouseMove(e: MouseEvent): void {
       disableEvent(e)
+      recordMouseEvent('move')
       const { x, y } = getCoordinate(e)
       handleMouseEvent({ type: 'move', x, y })
     }
@@ -128,6 +144,7 @@ export const Absolute = (): ReactElement => {
       }
 
       const deltaY = (e.deltaY > 0 ? 1 : -1) * scrollDirection
+      recordMouseEvent('wheel')
       handleMouseEvent({ type: 'wheel', deltaY })
       lastScrollTimeRef.current = currentTime
     }

@@ -25,6 +25,16 @@ const zh = {
     },
     video: {
       resolution: '分辨率',
+      frameRate: '帧率',
+      auto: '自动',
+      color: '色彩',
+      colorControls: {
+        brightness: '亮度',
+        contrast: '对比度',
+        saturation: '饱和度',
+        reset: '重置',
+        rangeExpand: '范围扩展'
+      },
       scale: '缩放',
       customResolution: '自定义',
       device: '设备',

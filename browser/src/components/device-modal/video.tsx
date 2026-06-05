@@ -3,7 +3,12 @@ import { Select } from 'antd';
 import { useAtom, useAtomValue } from 'jotai';
 import { useTranslation } from 'react-i18next';
 
-import { resolutionAtom, videoDeviceIdAtom, videoStateAtom } from '@/jotai/device.ts';
+import {
+  resolutionAtom,
+  videoDeviceIdAtom,
+  videoFrameRateAtom,
+  videoStateAtom
+} from '@/jotai/device.ts';
 import { camera } from '@/libs/media/camera';
 import * as storage from '@/libs/storage';
 import type { MediaDevice } from '@/types';
@@ -16,6 +21,7 @@ export const Video = ({ setErrMsg }: VideoProps) => {
   const { t } = useTranslation();
 
   const resolution = useAtomValue(resolutionAtom);
+  const videoFrameRate = useAtomValue(videoFrameRateAtom);
   const [videoDeviceId, setVideoDeviceId] = useAtom(videoDeviceIdAtom);
   const [videoState, setVideoState] = useAtom(videoStateAtom);
 
@@ -74,7 +80,13 @@ export const Video = ({ setErrMsg }: VideoProps) => {
     setErrMsg('');
 
     try {
-      await camera.open(videoId, resolution.width, resolution.height, device.audioId);
+      await camera.open({
+        id: videoId,
+        width: resolution.width,
+        height: resolution.height,
+        audioId: device.audioId,
+        frameRate: videoFrameRate
+      });
     } catch (err) {
       console.log(err);
       setErrMsg(t('camera.failed'));

@@ -3,7 +3,12 @@ import { Select } from 'antd'
 import { useAtom, useAtomValue } from 'jotai'
 import { useTranslation } from 'react-i18next'
 
-import { resolutionAtom, videoDeviceIdAtom, videoStateAtom } from '@renderer/jotai/device'
+import {
+  resolutionAtom,
+  videoDeviceIdAtom,
+  videoFrameRateAtom,
+  videoStateAtom
+} from '@renderer/jotai/device'
 import { camera } from '@renderer/libs/media/camera'
 import * as storage from '@renderer/libs/storage'
 import type { MediaDevice } from '@renderer/types'
@@ -16,6 +21,7 @@ export const Video = ({ setMsg }: VideoProps): ReactElement => {
   const { t } = useTranslation()
 
   const resolution = useAtomValue(resolutionAtom)
+  const videoFrameRate = useAtomValue(videoFrameRateAtom)
   const [videoState, setVideoState] = useAtom(videoStateAtom)
   const [videoDeviceId, setVideoDeviceId] = useAtom(videoDeviceIdAtom)
 
@@ -85,7 +91,13 @@ export const Video = ({ setMsg }: VideoProps): ReactElement => {
 
   async function openCamera(videoId: string, audioId?: string): Promise<void> {
     try {
-      await camera.open(videoId, resolution.width, resolution.height, audioId)
+      await camera.open({
+        id: videoId,
+        width: resolution.width,
+        height: resolution.height,
+        audioId,
+        frameRate: videoFrameRate
+      })
 
       const video = document.getElementById('video') as HTMLVideoElement
       if (!video) return

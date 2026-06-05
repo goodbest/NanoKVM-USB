@@ -6,6 +6,7 @@ import { createInitialTouchState, createTouchHandlers } from '@/components/mouse
 import { MouseAbsoluteEvent } from '@/components/mouse/types.ts';
 import { scrollDirectionAtom, scrollIntervalAtom } from '@/jotai/mouse.ts';
 import { device } from '@/libs/device';
+import { recordMouseEvent } from '@/libs/diagnostics/runtime.ts';
 import { MouseAbsoluteRelative } from '@/libs/mouse';
 import { mouseJiggler } from '@/libs/mouse-jiggler';
 
@@ -53,18 +54,21 @@ export const Absolute = () => {
     // Mouse down event
     function handleMouseDown(e: MouseEvent): void {
       disableEvent(e);
+      recordMouseEvent('button');
       handleMouseEvent({ type: 'mousedown', button: e.button });
     }
 
     // Mouse up event
     function handleMouseUp(e: MouseEvent): void {
       disableEvent(e);
+      recordMouseEvent('button');
       handleMouseEvent({ type: 'mouseup', button: e.button });
     }
 
     // Mouse move event
     function handleMouseMove(e: MouseEvent): void {
       disableEvent(e);
+      recordMouseEvent('move');
       const { x, y } = getCoordinate(e);
       handleMouseEvent({ type: 'move', x, y });
     }
@@ -83,6 +87,7 @@ export const Absolute = () => {
       }
 
       const deltaY = (e.deltaY > 0 ? 1 : -1) * scrollDirection;
+      recordMouseEvent('wheel');
       handleMouseEvent({ type: 'wheel', deltaY });
       lastScrollTimeRef.current = currentTime;
     }

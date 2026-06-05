@@ -1,4 +1,4 @@
-import type { Resolution } from '@renderer/types'
+import type { Resolution, VideoColor, VideoFrameRate } from '@renderer/types'
 
 import { getWithExpiry, setWithExpiry } from './expiry'
 
@@ -6,6 +6,8 @@ const LANGUAGE_KEY = 'nanokvm-usb-language'
 const VIDEO_DEVICE_ID_KEY = 'nanokvm-usb-video-device-id'
 const VIDEO_RESOLUTION_KEY = 'nanokvm-usb-video-resolution'
 const VIDEO_SCALE_KEY = 'nanokvm-usb-video-scale'
+const VIDEO_FRAME_RATE_KEY = 'nanokvm-usb-video-frame-rate'
+const VIDEO_COLOR_KEY = 'nanokvm-usb-video-color'
 const CUSTOM_RESOLUTION_KEY = 'nanokvm-usb-custom-resolution'
 const SERIAL_PORT_KEY = 'nanokvm-serial-port'
 const IS_MENU_OPEN_KEY = 'nanokvm-is-menu-open'
@@ -77,6 +79,51 @@ export function getVideoScale(): number | null {
 
 export function setVideoScale(scale: number): void {
   localStorage.setItem(VIDEO_SCALE_KEY, String(scale))
+}
+
+export function getVideoFrameRate(): VideoFrameRate | null {
+  const frameRate = localStorage.getItem(VIDEO_FRAME_RATE_KEY)
+  if (frameRate === 'auto') {
+    return frameRate
+  }
+
+  const value = Number(frameRate)
+  if (value === 60 || value === 50 || value === 30 || value === 25) {
+    return value
+  }
+
+  return null
+}
+
+export function setVideoFrameRate(frameRate: VideoFrameRate): void {
+  localStorage.setItem(VIDEO_FRAME_RATE_KEY, String(frameRate))
+}
+
+export function getVideoColor(): VideoColor | null {
+  const value = localStorage.getItem(VIDEO_COLOR_KEY)
+  if (!value) return null
+
+  try {
+    const color = window.JSON.parse(value) as Partial<VideoColor>
+    const brightness = Number(color.brightness)
+    const contrast = Number(color.contrast)
+    const saturation = Number(color.saturation)
+    if (
+      !Number.isFinite(brightness) ||
+      !Number.isFinite(contrast) ||
+      !Number.isFinite(saturation)
+    ) {
+      return null
+    }
+
+    return { brightness, contrast, saturation }
+  } catch {
+    return null
+  }
+}
+
+export function setVideoColor(color: VideoColor): void {
+  localStorage.setItem(VIDEO_COLOR_KEY, window.JSON.stringify(color))
 }
 
 export function getSerialPort(): string | null {
@@ -165,6 +212,8 @@ export function clearAllSettings(): void {
   localStorage.removeItem(LANGUAGE_KEY)
   localStorage.removeItem(VIDEO_DEVICE_ID_KEY)
   localStorage.removeItem(VIDEO_RESOLUTION_KEY)
+  localStorage.removeItem(VIDEO_FRAME_RATE_KEY)
+  localStorage.removeItem(VIDEO_COLOR_KEY)
   localStorage.removeItem(CUSTOM_RESOLUTION_KEY)
   localStorage.removeItem(SERIAL_PORT_KEY)
   localStorage.removeItem(IS_MENU_OPEN_KEY)

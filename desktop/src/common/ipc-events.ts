@@ -11,6 +11,7 @@ export enum IpcEvents {
   OPEN_SERIAL_PORT_RSP = 'open-serial-port-rsp',
   CLOSE_SERIAL_PORT = 'close-serial-port',
   SERIAL_PORT_DISCONNECTED = 'serial-port-disconnected',
+  GET_DEVICE_INFO = 'get-device-info',
   SEND_KEYBOARD = 'send-keyboard',
   SEND_MOUSE = 'send-mouse',
 

@@ -11,6 +11,7 @@ on:
 
 env:
   NODE_VERSION: '20'
+  PNPM_VERSION: '11.5.2'
 
 jobs:
   detect-changes:
@@ -32,8 +33,10 @@ jobs:
           filters: |
             browser:
               - 'browser/**'
+              - '.github/workflows/build.yml'
             desktop:
               - 'desktop/**'
+              - '.github/workflows/build.yml'
 
   build-browser:
     name: Build Browser Bundle
@@ -47,16 +50,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: browser/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
 
       - name: Build static site
-        run: npm run build
+        run: pnpm run build
 
       - name: Upload browser dist
         uses: actions/upload-artifact@v4
@@ -82,6 +95,10 @@ jobs:
             target: windows
             build_script: build:win
             artifact_name: desktop-windows
+          - os: macos-14
+            target: macos
+            build_script: build:mac-full
+            artifact_name: desktop-macos
     defaults:
       run:
         working-directory: desktop
@@ -91,10 +108,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
 
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -103,10 +127,16 @@ jobs:
           sudo apt-get install -y build-essential python3 libudev-dev rpm
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
 
       - name: Build desktop package
-        run: npm run ${{ matrix.build_script }}
+        run: pnpm run ${{ matrix.build_script }}
 
       - name: Upload desktop artifacts
         uses: actions/upload-artifact@v4

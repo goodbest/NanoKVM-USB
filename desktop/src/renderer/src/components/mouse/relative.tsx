@@ -5,6 +5,12 @@ import { useTranslation } from 'react-i18next'
 
 import { IpcEvents } from '@common/ipc-events'
 import { scrollDirectionAtom, scrollIntervalAtom } from '@renderer/jotai/mouse'
+import {
+  recordMouseEvent,
+  recordMouseReport,
+  recordSerialError,
+  recordSerialWrite
+} from '@renderer/libs/diagnostics/runtime'
 import { MouseReportRelative } from '@renderer/libs/mouse'
 import { mouseJiggler } from '@renderer/libs/mouse-jiggler'
 
@@ -47,12 +53,14 @@ export const Relative = (): ReactElement => {
     // Mouse down event
     function handleMouseDown(e: MouseEvent): void {
       disableEvent(e)
+      recordMouseEvent('button')
       handleMouseEvent({ type: 'mousedown', button: e.button })
     }
 
     // Mouse up event
     function handleMouseUp(e: MouseEvent): void {
       disableEvent(e)
+      recordMouseEvent('button')
       handleMouseEvent({ type: 'mouseup', button: e.button })
     }
 
@@ -67,6 +75,7 @@ export const Relative = (): ReactElement => {
       const deltaX = Math.abs(x * window.devicePixelRatio) < 10 ? x * 2 : x
       const deltaY = Math.abs(y * window.devicePixelRatio) < 10 ? y * 2 : y
 
+      recordMouseEvent('move')
       handleMouseEvent({ type: 'move', deltaX, deltaY })
     }
 
@@ -84,6 +93,7 @@ export const Relative = (): ReactElement => {
       }
 
       const deltaY = (e.deltaY > 0 ? 1 : -1) * scrollDirection
+      recordMouseEvent('wheel')
       handleMouseEvent({ type: 'wheel', deltaY })
       lastScrollTimeRef.current = currentTime
     }
@@ -134,7 +144,14 @@ export const Relative = (): ReactElement => {
         break
     }
 
-    window.electron.ipcRenderer.invoke(IpcEvents.SEND_MOUSE, [0x01, ...report])
+    const startTime = performance.now()
+    window.electron.ipcRenderer
+      .invoke(IpcEvents.SEND_MOUSE, [0x01, ...report])
+      .then(() => {
+        recordSerialWrite(performance.now() - startTime)
+        recordMouseReport()
+      })
+      .catch(recordSerialError)
 
     mouseJiggler.moveEventCallback()
   }

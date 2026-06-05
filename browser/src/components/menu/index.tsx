@@ -9,6 +9,7 @@ import { serialStateAtom } from '@/jotai/device.ts';
 import * as storage from '@/libs/storage';
 
 import { Audio } from './audio';
+import { Debug } from './debug';
 import { Fullscreen } from './fullscreen';
 import { Keyboard } from './keyboard';
 import { Mouse } from './mouse';
@@ -102,6 +103,7 @@ export const Menu = () => {
             )}
 
             <Recorder />
+            <Debug />
 
             <Divider type="vertical" className="px-0.5" />
 

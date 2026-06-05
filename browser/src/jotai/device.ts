@@ -1,6 +1,6 @@
 import { atom } from 'jotai';
 
-import type { Resolution, Rotation } from '@/types.ts';
+import type { Resolution, Rotation, VideoFrameRate } from '@/types.ts';
 
 type VideoState = 'disconnected' | 'connecting' | 'connected';
 type SerialState = 'notSupported' | 'disconnected' | 'connecting' | 'connected';
@@ -11,6 +11,8 @@ export const resolutionAtom = atom<Resolution>({
 });
 
 export const videoScaleAtom = atom<number>(1.0);
+
+export const videoFrameRateAtom = atom<VideoFrameRate>(60);
 
 export const videoRotationAtom = atom<Rotation>(0);
 

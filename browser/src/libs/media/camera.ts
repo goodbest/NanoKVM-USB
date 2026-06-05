@@ -1,27 +1,43 @@
 import { checkPermission } from '@/libs/media/permission.ts';
+import type { VideoFrameRate } from '@/types.ts';
+
+type OpenOptions = {
+  id: string;
+  width: number;
+  height: number;
+  audioId?: string;
+  frameRate?: VideoFrameRate;
+};
 
 class Camera {
   id: string = '';
   width: number = 1920;
   height: number = 1080;
+  frameRate: VideoFrameRate = 60;
   audioId: string = '';
   stream: MediaStream | null = null;
 
-  public async open(id: string, width: number, height: number, audioId?: string) {
+  public async open({ id, width, height, audioId, frameRate = this.frameRate }: OpenOptions) {
     if (!id && !this.id) {
       return;
     }
 
     this.close();
 
-    const video = {
+    const video: MediaTrackConstraints & {
+      latency?: { ideal: number };
+      resizeMode?: string;
+    } = {
       deviceId: { exact: id },
       width: { ideal: width },
       height: { ideal: height },
-      frameRate: { ideal: 60 },
       latency: { ideal: 0 },
       resizeMode: 'none'
     };
+
+    if (frameRate !== 'auto') {
+      video.frameRate = { ideal: frameRate };
+    }
 
     const isMicGranted = await checkPermission('microphone');
     const audio =
@@ -39,6 +55,7 @@ class Camera {
     this.id = id;
     this.width = width;
     this.height = height;
+    this.frameRate = frameRate;
     if (audioId) this.audioId = audioId;
 
     try {
@@ -49,7 +66,23 @@ class Camera {
   }
 
   public async updateResolution(width: number, height: number) {
-    return this.open(this.id, width, height, this.audioId);
+    return this.open({
+      id: this.id,
+      width,
+      height,
+      audioId: this.audioId,
+      frameRate: this.frameRate
+    });
+  }
+
+  public async updateFrameRate(frameRate: VideoFrameRate) {
+    return this.open({
+      id: this.id,
+      width: this.width,
+      height: this.height,
+      audioId: this.audioId,
+      frameRate
+    });
   }
 
   public close(): void {
