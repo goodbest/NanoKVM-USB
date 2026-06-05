@@ -1,4 +1,4 @@
-name: Create Tag and Release
+name: Build and Publish Release
 
 on:
   workflow_dispatch:
@@ -13,6 +13,9 @@ on:
         required: false
         type: boolean
         default: false
+  push:
+    tags:
+      - 'v*'
 
 env:
   NODE_VERSION: '22.13'
@@ -22,33 +25,56 @@ permissions:
   contents: write
 
 jobs:
-  create-tag:
-    name: Create Git Tag
+  prepare-release:
+    name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
-      release_tag: ${{ steps.version.outputs.tag }}
+      release_tag: ${{ steps.release.outputs.tag }}
+      draft: ${{ steps.release.outputs.draft }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Read version from package.json
-        id: version
+      - name: Resolve release tag
+        id: release
+        env:
+          DISPATCH_DRAFT: ${{ inputs.draft }}
+          DISPATCH_PRERELEASE: ${{ inputs.prerelease }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION=$(jq -r .version desktop/package.json)
-          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION=$(jq -r .version desktop/package.json)
+            TAG="v${VERSION}"
+            DRAFT="${DISPATCH_DRAFT:-false}"
+            PRERELEASE="${DISPATCH_PRERELEASE:-false}"
 
-      - name: Create and push tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a ${{ steps.version.outputs.tag }} -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin ${{ steps.version.outputs.tag }}
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "Tag $TAG already exists locally."
+            elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              echo "Tag $TAG already exists on origin."
+            else
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git tag -a "$TAG" -m "Release $TAG"
+              git push origin "$TAG"
+            fi
+          else
+            TAG="$REF_NAME"
+            DRAFT="false"
+            PRERELEASE="false"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
   build-browser:
     name: Build Browser Bundle
-    needs: create-tag
+    needs: prepare-release
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -57,7 +83,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.create-tag.outputs.release_tag }}
+          ref: ${{ needs.prepare-release.outputs.release_tag }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -80,19 +106,19 @@ jobs:
       - name: Create browser archive
         run: |
            cd dist
-           zip -r ../nanokvm-usb-browser-${{ needs.create-tag.outputs.release_tag }}.zip .
+           zip -r ../nanokvm-usb-browser-${{ needs.prepare-release.outputs.release_tag }}.zip .
            cd ..
 
       - name: Upload browser artifact
         uses: actions/upload-artifact@v7
         with:
            name: browser-release
-           path: browser/nanokvm-usb-browser-${{ needs.create-tag.outputs.release_tag }}.zip
+           path: browser/nanokvm-usb-browser-${{ needs.prepare-release.outputs.release_tag }}.zip
            if-no-files-found: error
 
   build-desktop:
     name: Build Desktop Apps
-    needs: create-tag
+    needs: prepare-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -124,7 +150,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.create-tag.outputs.release_tag }}
+          ref: ${{ needs.prepare-release.outputs.release_tag }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -173,7 +199,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [create-tag, build-browser, build-desktop]
+    needs: [prepare-release, build-browser, build-desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -189,10 +215,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.create-tag.outputs.release_tag }}
-          name: ${{ needs.create-tag.outputs.release_tag }}
-          draft: ${{ inputs.draft }}
-          prerelease: ${{ inputs.prerelease }}
+          tag_name: ${{ needs.prepare-release.outputs.release_tag }}
+          name: ${{ needs.prepare-release.outputs.release_tag }}
+          draft: ${{ needs.prepare-release.outputs.draft }}
+          prerelease: ${{ needs.prepare-release.outputs.prerelease }}
           files: |
             release-artifacts/**/*
           generate_release_notes: true
