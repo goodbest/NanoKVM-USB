@@ -10,7 +10,7 @@ on:
       - main
 
 env:
-  NODE_VERSION: '20'
+  NODE_VERSION: '22.13'
   PNPM_VERSION: '11.5.2'
 
 jobs:
