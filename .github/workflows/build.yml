@@ -1,4 +1,4 @@
-name: Build Browser and Desktop Apps
+name: Build Browser, Desktop, and Native macOS Apps
 
 on:
   workflow_dispatch:
@@ -20,6 +20,7 @@ jobs:
     outputs:
       browser: ${{ steps.filter.outputs.browser }}
       desktop: ${{ steps.filter.outputs.desktop }}
+      native_macos: ${{ steps.filter.outputs.native_macos }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -36,6 +37,9 @@ jobs:
               - '.github/workflows/build.yml'
             desktop:
               - 'desktop/**'
+              - '.github/workflows/build.yml'
+            native_macos:
+              - 'macos/**'
               - '.github/workflows/build.yml'
 
   build-browser:
@@ -143,4 +147,34 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: desktop/dist
+          if-no-files-found: error
+
+  build-native-macos:
+    name: Build Native macOS Client
+    needs: detect-changes
+    runs-on: macos-14
+    if: needs.detect-changes.outputs.native_macos == 'true'
+    defaults:
+      run:
+        working-directory: macos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build native app
+        run: bash build.command
+
+      - name: Verify app bundle
+        run: |
+          file NanoKVM.app/Contents/MacOS/NanoKVM
+          codesign --verify --deep --strict --verbose=2 NanoKVM.app
+
+      - name: Archive native app
+        run: ditto -c -k --keepParent NanoKVM.app ../nanokvm-usb-native-macos-arm64.zip
+
+      - name: Upload native macOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-macos-arm64
+          path: nanokvm-usb-native-macos-arm64.zip
           if-no-files-found: error

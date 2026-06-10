@@ -1,0 +1,4 @@
+NanoKVM.app/
+NanoKVM_bin
+*.dSYM/
+*.zip

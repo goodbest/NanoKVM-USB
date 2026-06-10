@@ -197,9 +197,40 @@ jobs:
             desktop/dist/latest*.yml
           if-no-files-found: error
 
+  build-native-macos:
+    name: Build Native macOS Client
+    needs: prepare-release
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: macos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_tag }}
+
+      - name: Build native app
+        run: bash build.command
+
+      - name: Verify app bundle
+        run: |
+          file NanoKVM.app/Contents/MacOS/NanoKVM
+          codesign --verify --deep --strict --verbose=2 NanoKVM.app
+
+      - name: Create native app archive
+        run: ditto -c -k --keepParent NanoKVM.app ../nanokvm-usb-native-macos-arm64-${{ needs.prepare-release.outputs.release_tag }}.zip
+
+      - name: Upload native app artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-macos-arm64
+          path: nanokvm-usb-native-macos-arm64-${{ needs.prepare-release.outputs.release_tag }}.zip
+          if-no-files-found: error
+
   create-release:
     name: Create GitHub Release
-    needs: [prepare-release, build-browser, build-desktop]
+    needs: [prepare-release, build-browser, build-desktop, build-native-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
