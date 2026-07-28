@@ -91,7 +91,6 @@ struct Config {
     static let backgroundRefreshPaused: TimeInterval = -1
     static let backgroundRefreshLive: TimeInterval = 0
     static let backgroundRefreshDefault: TimeInterval = backgroundRefreshAdaptive
-    static let backgroundStatusThreshold: TimeInterval = 5
     static let backgroundRefreshPolicyVersion = 5
     static let adaptiveRefreshFast: TimeInterval = 5
     static let adaptiveRefreshMedium: TimeInterval = 30
@@ -102,8 +101,10 @@ struct Config {
     static let preferredDefaultVideoW = 1920
     static let preferredDefaultVideoH = 1080
     static let inactivePauseGrace: TimeInterval = 3.0
+    static let backgroundSnapshotTimeout: TimeInterval = 3.0
     static let foregroundResumeRevealDelay: TimeInterval = 0.45
     static let foregroundResumeFramesRequired = 3
+    static let foregroundResumeWatchdogInterval: TimeInterval = 3.0
 }
 
 final class AudioRingBuffer {
@@ -916,15 +917,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     var frozenLayer: CALayer?
     var backgroundStatusLayer: CATextLayer?
     var refreshTimer: Timer?
+    private var videoPolicyLock = os_unfair_lock()
     var isBackgroundRefresh = false
+    var backgroundCaptureGeneration = 0
+    var backgroundFrameDispatchedGeneration = 0
     var backgroundRefreshInterval: TimeInterval = Config.backgroundRefreshDefault
     var backgroundRefreshStartedAt: Date?
     var lastBackgroundSnapshotAt: Date?
+    var backgroundCaptureWatchdog: DispatchWorkItem?
     var sessionWatchdog: DispatchWorkItem?
     var inactivePolicyWorkItem: DispatchWorkItem?
     var waitingForForegroundFrame = false
     var foregroundResumeFramesNeeded = 0
+    var foregroundResumeFramesInFlight = 0
     var resumeShieldGeneration = 0
+    var foregroundResumeWatchdog: DispatchWorkItem?
     var pendingUnfreezeWorkItem: DispatchWorkItem?
     var frameOutput: AVCaptureVideoDataOutput?
     let frameQueue = DispatchQueue(label: "com.nanokvm.frame", qos: .userInitiated)
@@ -962,7 +969,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let policyVersion = UserDefaults.standard.integer(forKey: "backgroundRefreshPolicyVersion")
         let savedBackgroundRefresh = UserDefaults.standard.object(forKey: "backgroundRefresh") as? Double
         if policyVersion < Config.backgroundRefreshPolicyVersion {
-            // Migrate earlier defaults while preserving deliberately selected modes.
+            // Move legacy 5s/60s defaults to adaptive; preserve live, paused, and other intervals.
             backgroundRefreshInterval =
                 savedBackgroundRefresh == nil ||
                 savedBackgroundRefresh == Config.adaptiveRefreshFast ||
@@ -1932,19 +1939,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         resumeForegroundVideoAfterShield()
     }
     func windowDidChangeOcclusionState(_ n: Notification) {
-        if !window.occlusionState.contains(.visible) {
+        if !isWindowVisibleForMonitoring() {
+            sessionWatchdog?.cancel()
+            sessionWatchdog = nil
             showTransitionResumeShield()
-        } else {
-            resumeForegroundVideoAfterShield()
+            scheduleInactiveWindowVideoPolicy()
+            return
         }
-        applyVisibilityAwareLivePolicy()
+        if NSApp.isActive && window.isKeyWindow {
+            inactivePolicyWorkItem?.cancel()
+            inactivePolicyWorkItem = nil
+            refreshTimer?.invalidate()
+            refreshTimer = nil
+            cancelBackgroundSnapshotCapture()
+            backgroundRefreshStartedAt = nil
+            sessionQueue.async { [weak self] in self?.session?.startRunning() }
+            resumeForegroundVideoAfterShield()
+            return
+        }
+        scheduleInactiveWindowVideoPolicy()
     }
     func windowDidResignKey(_ n: Notification) {
-        waitingForForegroundFrame = false
-        foregroundResumeFramesNeeded = 0
+        beginResumeShield()
         inactivePolicyWorkItem?.cancel()
         inactivePolicyWorkItem = nil
-        showTransitionResumeShield()
         leaveVideoInputRegion()
         showSystemCursorIfHidden()
         stopMouseFlush()
@@ -1965,39 +1983,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if let out = audioOutputUnit { AudioOutputUnitStart(out) }
         refreshTimer?.invalidate()
         refreshTimer = nil
-        isBackgroundRefresh = false
+        cancelBackgroundSnapshotCapture()
         backgroundRefreshStartedAt = nil
         sessionQueue.async { [weak self] in
             self?.session?.startRunning()
         }
-        resumeForegroundVideoAfterShield(forceShield: window.styleMask.contains(.fullScreen))
-        sessionWatchdog?.cancel()
-        let wd = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.sessionWatchdog = nil
-            self.enableFrameOutput()
-            self.sessionQueue.async {
-                self.session?.stopRunning()
-                self.session?.startRunning()
-            }
-        }
-        sessionWatchdog = wd
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: wd)
+        resumeForegroundVideoAfterShield()
     }
 
     func scheduleInactiveWindowVideoPolicy() {
+        inactivePolicyWorkItem?.cancel()
+        inactivePolicyWorkItem = nil
+        if shouldKeepInactiveVideoLive() {
+            applyInactiveWindowVideoPolicy()
+            return
+        }
+        if frozenLayer != nil {
+            applyInactiveWindowVideoPolicy()
+            return
+        }
         guard !isRecording,
-              (backgroundRefreshInterval == Config.backgroundRefreshAdaptive ||
-                backgroundRefreshInterval > Config.backgroundRefreshLive),
-              window.occlusionState.contains(.visible),
-              !window.isMiniaturized else {
+              usesPeriodicBackgroundRefresh(),
+              isWindowVisibleForMonitoring() else {
             applyInactiveWindowVideoPolicy()
             return
         }
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.inactivePolicyWorkItem = nil
-            guard self.window?.isKeyWindow != true else { return }
+            guard !self.shouldPresentLiveVideo() else { return }
             self.applyInactiveWindowVideoPolicy()
         }
         inactivePolicyWorkItem = item
@@ -2005,27 +2019,133 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func backgroundRefresh() {
-        guard window?.isKeyWindow != true,
+        guard !shouldPresentLiveVideo(),
               usesPeriodicBackgroundRefresh(),
-              !isBackgroundRefresh else { return }
-        isBackgroundRefresh = true
-        enableFrameOutput()
-        sessionQueue.async { [weak self] in self?.session?.startRunning() }
+              !shouldKeepInactiveVideoLive() else { return }
+        beginBackgroundSnapshotCapture()
     }
 
-    func pauseSessionForBackground() {
-        lastBackgroundSnapshotAt = Date()
-        guard freezeFrame(showStatus: true) else { return }
-        sessionQueue.async { [weak self] in self?.session?.stopRunning() }
+    func requestFreshBackgroundSnapshot() {
+        guard !shouldPresentLiveVideo(),
+              !isRecording,
+              backgroundRefreshInterval != Config.backgroundRefreshLive,
+              !shouldKeepInactiveVideoLive() else { return }
+        beginBackgroundSnapshotCapture()
+    }
+
+    func beginBackgroundSnapshotCapture() {
+        os_unfair_lock_lock(&videoPolicyLock)
+        guard !isBackgroundRefresh else {
+            os_unfair_lock_unlock(&videoPolicyLock)
+            return
+        }
+        backgroundCaptureGeneration &+= 1
+        let generation = backgroundCaptureGeneration
+        isBackgroundRefresh = true
+        os_unfair_lock_unlock(&videoPolicyLock)
+        enableFrameOutput()
+        sessionQueue.async { [weak self] in self?.session?.startRunning() }
+        scheduleBackgroundSnapshotWatchdog(generation: generation)
+    }
+
+    func cancelBackgroundSnapshotCapture() {
+        backgroundCaptureWatchdog?.cancel()
+        backgroundCaptureWatchdog = nil
+        os_unfair_lock_lock(&videoPolicyLock)
+        backgroundCaptureGeneration &+= 1
+        isBackgroundRefresh = false
+        os_unfair_lock_unlock(&videoPolicyLock)
+    }
+
+    func claimBackgroundSnapshotFrame() -> Int? {
+        os_unfair_lock_lock(&videoPolicyLock)
+        defer { os_unfair_lock_unlock(&videoPolicyLock) }
+        guard isBackgroundRefresh,
+              backgroundFrameDispatchedGeneration != backgroundCaptureGeneration else {
+            return nil
+        }
+        backgroundFrameDispatchedGeneration = backgroundCaptureGeneration
+        return backgroundCaptureGeneration
+    }
+
+    func releaseBackgroundSnapshotFrame(generation: Int) {
+        os_unfair_lock_lock(&videoPolicyLock)
+        if isBackgroundRefresh,
+           backgroundCaptureGeneration == generation,
+           backgroundFrameDispatchedGeneration == generation {
+            backgroundFrameDispatchedGeneration = 0
+        }
+        os_unfair_lock_unlock(&videoPolicyLock)
+    }
+
+    func completeBackgroundSnapshotCapture(generation: Int) -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        guard isBackgroundRefresh,
+              backgroundCaptureGeneration == generation else {
+            os_unfair_lock_unlock(&videoPolicyLock)
+            return false
+        }
+        isBackgroundRefresh = false
+        os_unfair_lock_unlock(&videoPolicyLock)
+        backgroundCaptureWatchdog?.cancel()
+        backgroundCaptureWatchdog = nil
+        return true
+    }
+
+    func isBackgroundSnapshotCaptureActive() -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        let active = isBackgroundRefresh
+        os_unfair_lock_unlock(&videoPolicyLock)
+        return active
+    }
+
+    func expireBackgroundSnapshotCapture(generation: Int) -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        defer { os_unfair_lock_unlock(&videoPolicyLock) }
+        guard isBackgroundRefresh,
+              backgroundCaptureGeneration == generation else { return false }
+        isBackgroundRefresh = false
+        return true
+    }
+
+    func scheduleBackgroundSnapshotWatchdog(generation: Int) {
+        backgroundCaptureWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.expireBackgroundSnapshotCapture(generation: generation) else { return }
+            self.backgroundCaptureWatchdog = nil
+            guard !self.shouldPresentLiveVideo(),
+                  !self.isRecording,
+                  self.backgroundRefreshInterval != Config.backgroundRefreshLive else { return }
+            _ = self.freezeFrame(showStatus: true)
+            self.updateBackgroundStatusLayer()
+            self.sessionQueue.async { self.session?.stopRunning() }
+            if self.usesPeriodicBackgroundRefresh() {
+                self.startBackgroundRefreshTimer()
+            }
+        }
+        backgroundCaptureWatchdog = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Config.backgroundSnapshotTimeout,
+            execute: item)
     }
 
     func freezeFrame(showStatus: Bool) -> Bool {
+        guard let snapshot = cgImageFromLatestBuffer() else { return false }
+        return freezeFrame(snapshot: snapshot, showStatus: showStatus)
+    }
+
+    func freezeFrame(snapshot: CGImage, showStatus: Bool) -> Bool {
         guard let layer = videoView.layer else { return false }
-        if frozenLayer != nil {
+        if let frozen = frozenLayer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            frozen.contents = snapshot
+            frozen.contentsScale = window.backingScaleFactor
+            CATransaction.commit()
             updateBackgroundStatusLayer(show: showStatus)
             return true
         }
-        guard let snapshot = cgImageFromLatestBuffer() else { return false }
         let frozen = CALayer()
         frozen.frame = layer.bounds
         frozen.contentsScale = window.backingScaleFactor
@@ -2045,77 +2165,188 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
               window.styleMask.contains(.fullScreen) ||
                 !window.occlusionState.contains(.visible) else { return }
         beginResumeShield()
-        lastBackgroundSnapshotAt = Date()
         if !freezeFrame(showStatus: false) {
             enableFrameOutput()
         }
     }
 
     func beginResumeShield() {
-        resumeShieldGeneration += 1
+        cancelForegroundResume()
         pendingUnfreezeWorkItem?.cancel()
         pendingUnfreezeWorkItem = nil
-        waitingForForegroundFrame = false
-        foregroundResumeFramesNeeded = 0
     }
 
-    func resumeForegroundVideoAfterShield(forceShield: Bool = false) {
+    func cancelForegroundResume() {
+        foregroundResumeWatchdog?.cancel()
+        foregroundResumeWatchdog = nil
+        os_unfair_lock_lock(&videoPolicyLock)
+        resumeShieldGeneration += 1
+        waitingForForegroundFrame = false
+        foregroundResumeFramesNeeded = 0
+        foregroundResumeFramesInFlight = 0
+        os_unfair_lock_unlock(&videoPolicyLock)
+    }
+
+    func resumeForegroundVideoAfterShield() {
         guard window != nil,
-              NSApp.isActive,
-              window.isKeyWindow,
-              window.occlusionState.contains(.visible),
-              !window.isMiniaturized else { return }
-        if forceShield && frozenLayer == nil {
-            beginResumeShield()
-            _ = freezeFrame(showStatus: false)
-        }
+              shouldPresentLiveVideo() else { return }
         if frozenLayer != nil {
+            sessionWatchdog?.cancel()
+            sessionWatchdog = nil
             prepareForegroundResumeOverlay()
+        } else {
+            scheduleLiveSessionWatchdog()
         }
         enableFrameOutput()
     }
 
+    func scheduleLiveSessionWatchdog() {
+        sessionWatchdog?.cancel()
+        let wd = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.sessionWatchdog = nil
+            guard self.shouldPresentLiveVideo() else { return }
+            self.enableFrameOutput()
+            self.sessionQueue.async {
+                self.session?.stopRunning()
+                self.session?.startRunning()
+            }
+        }
+        sessionWatchdog = wd
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Config.foregroundResumeWatchdogInterval,
+            execute: wd)
+    }
+
     func prepareForegroundResumeOverlay() {
         guard let frozen = frozenLayer else { return }
+        os_unfair_lock_lock(&videoPolicyLock)
         resumeShieldGeneration += 1
-        pendingUnfreezeWorkItem?.cancel()
-        pendingUnfreezeWorkItem = nil
+        let generation = resumeShieldGeneration
         waitingForForegroundFrame = true
         foregroundResumeFramesNeeded = Config.foregroundResumeFramesRequired
+        foregroundResumeFramesInFlight = 0
+        os_unfair_lock_unlock(&videoPolicyLock)
+        pendingUnfreezeWorkItem?.cancel()
+        pendingUnfreezeWorkItem = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         frozen.opacity = 1
         CATransaction.commit()
-        backgroundStatusLayer?.removeFromSuperlayer()
-        backgroundStatusLayer = nil
+        updateForegroundResumeStatusLayer()
+        scheduleForegroundResumeWatchdog(generation: generation)
     }
 
-    func finishForegroundResume(with image: CGImage?) {
-        guard waitingForForegroundFrame else { return }
-        if let image, let frozen = frozenLayer {
+    func finishForegroundResume(with image: CGImage?, generation: Int) {
+        guard let image,
+              let isComplete = acceptForegroundResumeFrame(generation: generation) else { return }
+        if let frozen = frozenLayer {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             frozen.contents = image
             frozen.opacity = 1
             CATransaction.commit()
         }
-        foregroundResumeFramesNeeded = max(0, foregroundResumeFramesNeeded - 1)
-        guard foregroundResumeFramesNeeded == 0 else { return }
-        waitingForForegroundFrame = false
-        scheduleUnfreezeForCurrentShield()
+        if isComplete {
+            clearBackgroundStatusLayer()
+            foregroundResumeWatchdog?.cancel()
+            foregroundResumeWatchdog = nil
+            scheduleUnfreezeForCurrentShield(generation: generation)
+        }
     }
 
-    func scheduleUnfreezeForCurrentShield() {
-        let generation = resumeShieldGeneration
+    func claimForegroundResumeFrame() -> Int? {
+        os_unfair_lock_lock(&videoPolicyLock)
+        defer { os_unfair_lock_unlock(&videoPolicyLock) }
+        guard waitingForForegroundFrame,
+              foregroundResumeFramesInFlight < foregroundResumeFramesNeeded else { return nil }
+        foregroundResumeFramesInFlight += 1
+        return resumeShieldGeneration
+    }
+
+    func releaseForegroundResumeFrame(generation: Int) {
+        os_unfair_lock_lock(&videoPolicyLock)
+        if waitingForForegroundFrame,
+           resumeShieldGeneration == generation,
+           foregroundResumeFramesInFlight > 0 {
+            foregroundResumeFramesInFlight -= 1
+        }
+        os_unfair_lock_unlock(&videoPolicyLock)
+    }
+
+    func acceptForegroundResumeFrame(generation: Int) -> Bool? {
+        os_unfair_lock_lock(&videoPolicyLock)
+        defer { os_unfair_lock_unlock(&videoPolicyLock) }
+        guard waitingForForegroundFrame,
+              resumeShieldGeneration == generation,
+              foregroundResumeFramesInFlight > 0 else { return nil }
+        foregroundResumeFramesInFlight -= 1
+        foregroundResumeFramesNeeded = max(0, foregroundResumeFramesNeeded - 1)
+        let isComplete = foregroundResumeFramesNeeded == 0
+        if isComplete {
+            waitingForForegroundFrame = false
+        }
+        return isComplete
+    }
+
+    func isWaitingForForegroundFrame() -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        let waiting = waitingForForegroundFrame
+        os_unfair_lock_unlock(&videoPolicyLock)
+        return waiting
+    }
+
+    func canUnfreezeResumeShield(generation: Int) -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        let canUnfreeze =
+            resumeShieldGeneration == generation && !waitingForForegroundFrame
+        os_unfair_lock_unlock(&videoPolicyLock)
+        return canUnfreeze
+    }
+
+    func isForegroundResumePending(generation: Int) -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        let pending =
+            resumeShieldGeneration == generation && waitingForForegroundFrame
+        os_unfair_lock_unlock(&videoPolicyLock)
+        return pending
+    }
+
+    func scheduleForegroundResumeWatchdog(generation: Int) {
+        foregroundResumeWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.foregroundResumeWatchdog = nil
+            guard self.isForegroundResumePending(generation: generation),
+                  self.shouldPresentLiveVideo() else { return }
+            self.updateForegroundResumeStatusLayer()
+            self.enableFrameOutput()
+            self.sessionQueue.async { [weak self] in
+                guard let self,
+                      self.isForegroundResumePending(generation: generation) else { return }
+                self.session?.stopRunning()
+                self.session?.startRunning()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.isForegroundResumePending(generation: generation),
+                          self.shouldPresentLiveVideo() else { return }
+                    self.scheduleForegroundResumeWatchdog(generation: generation)
+                }
+            }
+        }
+        foregroundResumeWatchdog = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Config.foregroundResumeWatchdogInterval,
+            execute: item)
+    }
+
+    func scheduleUnfreezeForCurrentShield(generation: Int) {
         pendingUnfreezeWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingUnfreezeWorkItem = nil
-            guard self.resumeShieldGeneration == generation,
-                  !self.waitingForForegroundFrame,
-                  NSApp.isActive,
-                  self.window?.isKeyWindow == true,
-                  self.window?.occlusionState.contains(.visible) == true else { return }
+            guard self.canUnfreezeResumeShield(generation: generation),
+                  self.shouldPresentLiveVideo() else { return }
             self.unfreezeFrame()
         }
         pendingUnfreezeWorkItem = item
@@ -2129,6 +2360,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func usesPeriodicBackgroundRefresh() -> Bool {
         backgroundRefreshInterval == Config.backgroundRefreshAdaptive ||
             backgroundRefreshInterval > Config.backgroundRefreshLive
+    }
+
+    func isWindowVisibleForMonitoring() -> Bool {
+        window.occlusionState.contains(.visible) && !window.isMiniaturized
+    }
+
+    func isForegroundVideoWindow() -> Bool {
+        NSApp.isActive && window.isKeyWindow && isWindowVisibleForMonitoring()
+    }
+
+    func shouldKeepInactiveVideoLive() -> Bool {
+        guard !isForegroundVideoWindow(),
+              isWindowVisibleForMonitoring() else { return false }
+        return backgroundRefreshInterval == Config.backgroundRefreshLive ||
+            backgroundRefreshInterval == Config.backgroundRefreshAdaptive
+    }
+
+    func shouldPresentLiveVideo() -> Bool {
+        isForegroundVideoWindow() || shouldKeepInactiveVideoLive()
     }
 
     func currentBackgroundRefreshInterval() -> TimeInterval {
@@ -2164,8 +2414,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func backgroundMonitoringMode() -> String {
+        if isRecording {
+            return "live while recording"
+        }
         if backgroundRefreshInterval == Config.backgroundRefreshLive {
-            return window.occlusionState.contains(.visible) && !window.isMiniaturized
+            return isWindowVisibleForMonitoring()
                 ? "live while visible"
                 : "released while hidden"
         }
@@ -2173,14 +2426,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             return "paused when inactive"
         }
         if backgroundRefreshInterval == Config.backgroundRefreshAdaptive {
-            return "adaptive snapshots: 5s for 15m, 30s until 60m, then 60s"
+            return isWindowVisibleForMonitoring()
+                ? "adaptive: live while visible"
+                : "adaptive hidden snapshots: \(Int(currentBackgroundRefreshInterval()))s now"
         }
         return "snapshot every \(Int(backgroundRefreshInterval))s when inactive"
     }
 
     func shouldShowBackgroundStatus() -> Bool {
-        backgroundRefreshInterval == Config.backgroundRefreshPaused ||
-            currentBackgroundRefreshInterval() > Config.backgroundStatusThreshold
+        backgroundRefreshInterval != Config.backgroundRefreshLive &&
+            !shouldKeepInactiveVideoLive()
     }
 
     func updateBackgroundStatusLayer() {
@@ -2196,7 +2451,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             clearBackgroundStatusLayer()
             return
         }
-        guard frozenLayer != nil, let hostLayer = videoView.layer else { return }
+        guard let status = frozenFrameStatusLayer() else { return }
+        status.string = backgroundStatusText()
+        status.backgroundColor = NSColor.systemRed.withAlphaComponent(0.90).cgColor
+    }
+
+    func updateForegroundResumeStatusLayer() {
+        guard let status = frozenFrameStatusLayer() else { return }
+        status.string = "UPDATING LIVE VIEW - waiting for a fresh frame"
+        status.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.92).cgColor
+    }
+
+    func frozenFrameStatusLayer() -> CATextLayer? {
+        guard frozenLayer != nil, let hostLayer = videoView.layer else { return nil }
         let status: CATextLayer
         if let existing = backgroundStatusLayer {
             status = existing
@@ -2206,19 +2473,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             status.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
             status.fontSize = 13
             status.foregroundColor = NSColor.white.cgColor
-            status.backgroundColor = NSColor.systemRed.withAlphaComponent(0.90).cgColor
             status.cornerRadius = 6
-            status.contentsScale = window.backingScaleFactor
             status.autoresizingMask = [.layerMaxXMargin, .layerMinYMargin]
             hostLayer.addSublayer(status)
             backgroundStatusLayer = status
         }
-        status.string = backgroundStatusText()
+        status.contentsScale = window.backingScaleFactor
         status.frame = NSRect(
             x: 16,
             y: max(16, hostLayer.bounds.height - 50),
             width: min(430, max(260, hostLayer.bounds.width - 32)),
             height: 32)
+        return status
     }
 
     func clearBackgroundStatusLayer() {
@@ -2228,6 +2494,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func unfreezeFrame() {
         guard let frozen = frozenLayer else { return }
+        cancelForegroundResume()
         pendingUnfreezeWorkItem?.cancel()
         pendingUnfreezeWorkItem = nil
         frozenLayer = nil
@@ -2252,8 +2519,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func shouldKeepFrameOutputEnabled() -> Bool {
         debugWindow?.isVisible == true ||
             isRecording ||
-            waitingForForegroundFrame ||
-            isBackgroundRefresh
+            isWaitingForForegroundFrame() ||
+            isBackgroundSnapshotCaptureActive()
     }
 
     func startBackgroundRefreshTimer() {
@@ -2272,19 +2539,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func applyInactiveWindowVideoPolicy() {
         refreshTimer?.invalidate()
         refreshTimer = nil
-        backgroundRefreshStartedAt = Date()
-        guard !isRecording, backgroundRefreshInterval != Config.backgroundRefreshLive else {
+        if isRecording {
+            cancelBackgroundSnapshotCapture()
+            backgroundRefreshStartedAt = nil
             unfreezeFrame()
+            sessionQueue.async { [weak self] in self?.session?.startRunning() }
+            return
+        }
+        if shouldKeepInactiveVideoLive() {
+            cancelBackgroundSnapshotCapture()
+            backgroundRefreshStartedAt = nil
+            resumeForegroundVideoAfterShield()
+            sessionQueue.async { [weak self] in self?.session?.startRunning() }
+            return
+        }
+        if backgroundRefreshInterval == Config.backgroundRefreshLive {
+            cancelBackgroundSnapshotCapture()
+            beginResumeShield()
+            backgroundRefreshStartedAt = nil
             applyVisibilityAwareLivePolicy()
             return
         }
-        pauseSessionForBackground()
-        startBackgroundRefreshTimer()
+        beginResumeShield()
+        backgroundRefreshStartedAt = Date()
+        requestFreshBackgroundSnapshot()
     }
 
     func applyVisibilityAwareLivePolicy() {
         guard !isRecording, backgroundRefreshInterval == Config.backgroundRefreshLive else { return }
-        let isVisible = window.occlusionState.contains(.visible) && !window.isMiniaturized
+        let isVisible = isWindowVisibleForMonitoring()
         sessionQueue.async { [weak self] in
             guard let session = self?.session else { return }
             if isVisible {
@@ -2339,8 +2622,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func cgImageFromLatestBuffer() -> CGImage? {
-        guard let pb = latestPixelBuffer else { return nil }
+        guard let pb = currentLatestPixelBuffer() else { return nil }
         return cgImage(from: pb)
+    }
+
+    func storeLatestPixelBuffer(_ pixelBuffer: CVPixelBuffer?) {
+        os_unfair_lock_lock(&videoPolicyLock)
+        latestPixelBuffer = pixelBuffer
+        os_unfair_lock_unlock(&videoPolicyLock)
+    }
+
+    func currentLatestPixelBuffer() -> CVPixelBuffer? {
+        os_unfair_lock_lock(&videoPolicyLock)
+        let pixelBuffer = latestPixelBuffer
+        os_unfair_lock_unlock(&videoPolicyLock)
+        return pixelBuffer
+    }
+
+    func hasLatestPixelBuffer() -> Bool {
+        os_unfair_lock_lock(&videoPolicyLock)
+        let hasBuffer = latestPixelBuffer != nil
+        os_unfair_lock_unlock(&videoPolicyLock)
+        return hasBuffer
     }
 
     func cgImage(from pixelBuffer: CVPixelBuffer) -> CGImage? {
@@ -2579,8 +2882,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         submenu(menu, "Inactive window refresh") { sub in
             for (title, interval) in [
-                ("Adaptive: 5s for 15m, then 30s / 60s (default)", Config.backgroundRefreshAdaptive),
-                ("Live while visible", 0.0),
+                ("Adaptive: live visible; hidden 5s / 30s / 60s (default)", Config.backgroundRefreshAdaptive),
+                ("Live while visible; release when hidden", 0.0),
                 ("Every 1 second", 1.0),
                 ("Every 5 seconds", 5.0),
                 ("Every 10 seconds", 10.0),
@@ -2686,7 +2989,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func populateRecordMenu(_ menu: NSMenu) {
         addMenuGuard(menu)
         menuItem(menu, "Screenshot", #selector(takeScreenshot(_:)),
-                 enabled: latestPixelBuffer != nil || session != nil, icon: "camera")
+                 enabled: hasLatestPixelBuffer() || session != nil, icon: "camera")
         submenu(menu, "Screenshot format", icon: "photo") { sub in
             for (title, fmt) in [("PNG", ScreenshotFormat.png), ("JPEG", .jpeg), ("HEIC", .heic)] as [(String, ScreenshotFormat)] {
                 menuItem(sub, title, #selector(setScreenshotFormat(_:)),
@@ -3020,7 +3323,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         debugTextView = nil
         debugWindow = nil
-        if !isBackgroundRefresh {
+        if !shouldKeepFrameOutputEnabled() {
             disableFrameOutput()
         }
     }
@@ -3140,9 +3443,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             forKey: "backgroundRefreshPolicyVersion")
         refreshTimer?.invalidate()
         refreshTimer = nil
-        isBackgroundRefresh = false
+        cancelBackgroundSnapshotCapture()
         backgroundRefreshStartedAt = nil
-        if window.isKeyWindow {
+        if isForegroundVideoWindow() {
             unfreezeFrame()
             sessionQueue.async { [weak self] in self?.session?.startRunning() }
         } else {
@@ -3414,6 +3717,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 DispatchQueue.main.async {
                     self.isRecording = false
                     self.updateRecordToolbarIcon()
+                    if !self.shouldPresentLiveVideo() {
+                        self.scheduleInactiveWindowVideoPolicy()
+                    }
                 }
                 print("Failed to add movie output"); return
             }
@@ -3445,10 +3751,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 sess.commitConfiguration()
             }
         }
-        isRecording = false
-        movieFileOutput = nil
         DispatchQueue.main.async { [weak self] in
-            self?.updateRecordToolbarIcon()
+            guard let self else { return }
+            self.isRecording = false
+            self.movieFileOutput = nil
+            self.updateRecordToolbarIcon()
+            if !self.shouldPresentLiveVideo() {
+                self.scheduleInactiveWindowVideoPolicy()
+            }
         }
         if let error {
             print("Recording failed: \(error.localizedDescription)")
@@ -3461,9 +3771,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                        from connection: AVCaptureConnection) {
         if output === frameOutput {
             recordFrameMetrics(sampleBuffer)
-            latestPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+            let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+            storeLatestPixelBuffer(pixelBuffer)
             // Detect actual resolution from incoming frames
-            if let pb = latestPixelBuffer {
+            if let pb = pixelBuffer {
                 let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
                 if w != videoW || h != videoH {
                     videoW = w; videoH = h
@@ -3473,37 +3784,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     }
                 }
             }
-            if isBackgroundRefresh {
-                isBackgroundRefresh = false
-                let img = cgImageFromLatestBuffer()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.lastBackgroundSnapshotAt = Date()
-                    if let img {
-                        self.frozenLayer?.contents = img
+            if let generation = claimBackgroundSnapshotFrame() {
+                if let img = pixelBuffer.flatMap({ cgImage(from: $0) }) {
+                    let capturedAt = Date()
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,
+                              self.completeBackgroundSnapshotCapture(generation: generation)
+                        else { return }
+                        guard !self.shouldPresentLiveVideo(),
+                              !self.isRecording,
+                              self.backgroundRefreshInterval != Config.backgroundRefreshLive
+                        else { return }
+                        self.lastBackgroundSnapshotAt = capturedAt
+                        guard self.freezeFrame(snapshot: img, showStatus: true) else { return }
+                        self.sessionQueue.async { self.session?.stopRunning() }
+                        if self.usesPeriodicBackgroundRefresh() {
+                            self.startBackgroundRefreshTimer()
+                        }
                     }
-                    self.updateBackgroundStatusLayer()
-                    guard self.usesPeriodicBackgroundRefresh(),
-                          self.window?.isKeyWindow != true else { return }
-                    self.sessionQueue.async { self.session?.stopRunning() }
-                    self.startBackgroundRefreshTimer()
+                } else {
+                    releaseBackgroundSnapshotFrame(generation: generation)
                 }
             }
-            if waitingForForegroundFrame {
-                let img = latestPixelBuffer.flatMap { cgImage(from: $0) }
-                DispatchQueue.main.async { [weak self] in
-                    self?.finishForegroundResume(with: img)
+            if let generation = claimForegroundResumeFrame() {
+                if let img = pixelBuffer.flatMap({ cgImage(from: $0) }) {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.finishForegroundResume(with: img, generation: generation)
+                    }
+                } else {
+                    releaseForegroundResumeFrame(generation: generation)
                 }
             }
-            // Disable frame delivery in steady state — preview layer renders via GPU.
-            // Keep it enabled only while Debug is open so FPS/drop estimates can update.
-            if !shouldKeepFrameOutputEnabled() {
-                disableFrameOutput()
-            }
-            // Cancel session watchdog — frame arrived, session is healthy
+            // Frame-output policy and watchdog ownership live on the main queue.
             DispatchQueue.main.async { [weak self] in
-                self?.sessionWatchdog?.cancel()
-                self?.sessionWatchdog = nil
+                guard let self else { return }
+                if !self.shouldKeepFrameOutputEnabled() {
+                    self.disableFrameOutput()
+                }
+                self.sessionWatchdog?.cancel()
+                self.sessionWatchdog = nil
             }
             return
         }

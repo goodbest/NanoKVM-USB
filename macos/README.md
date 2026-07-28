@@ -27,7 +27,7 @@ The Chrome-based solution (WebSerial + getUserMedia) works but uses significant 
 - **Resolution persistence** — remembers manually selected resolution between launches; first-run defaults prefer 1080p instead of the capture dongle's highest advertised mode
 - **Paste to remote** — types clipboard contents as HID keystrokes with correct shift handling
 - **Mouse jiggler** — prevents remote machine from sleeping (30-second micro-movements)
-- **Background monitoring** — uses an adaptive low-CPU retained frame by default: after losing focus it refreshes every 5 seconds for 15 minutes, every 30 seconds until 60 minutes, then every 60 seconds. Optional Live while visible mode keeps an unfocused window on a second display continuously current; Paused and fixed snapshot intervals remain available.
+- **Background monitoring** — the default adaptive mode keeps the KVM window live while it is visible, including a fullscreen view on one display while you work on another. Once the window is fully covered, hidden, or minimized, it switches to low-CPU snapshots every 5 seconds for 15 minutes, every 30 seconds until 60 minutes, then every 60 seconds. Paused and fixed snapshot intervals remain available; retained inactive-window frames are visibly marked as not live.
 - **Session watchdog** — if the capture session fails to produce a frame within 3 seconds of refocusing (e.g. after long idle), it is automatically force-restarted
 - **Scoped cursor hiding** — the local cursor is hidden by default only while it is inside the rendered video area, with a fullscreen top-edge escape zone for macOS menu/toolbar access
 - **Minimal footprint** — single file, builds in seconds
@@ -42,7 +42,7 @@ The Debug panel keeps video sample-buffer output enabled while it is open so it 
 
 ## Privacy Indicators
 
-macOS shows the green camera indicator whenever the USB capture device video stream is active. The app cannot suppress that system indicator while it is displaying a current KVM video feed. The default **adaptive snapshot** inactive-window mode refreshes frequently just after focus loss, then backs off to reduce energy use. Remote audio no longer wakes video capture between scheduled snapshots. Optional **Live while visible** keeps an unfocused visible window current with the indicator steadily active; **Paused** releases capture completely.
+macOS shows the green camera indicator whenever the USB capture device video stream is active. The app cannot suppress that system indicator while it is displaying a current KVM video feed. The default visibility-aware adaptive mode keeps capture active while the KVM window remains visible, even when another app has keyboard focus, then backs off to scheduled snapshots after the window is fully covered, hidden, or minimized. Remote audio does not wake video capture between scheduled snapshots. **Live while visible** releases capture instead of taking hidden-window snapshots, while **Paused** and fixed snapshot modes remain explicit low-CPU alternatives.
 
 The yellow microphone indicator appears only when audio capture is running. This client does not start audio automatically; use the **Audio** toolbar menu to enable matching USB audio when needed, and **Stop Audio Capture** to release it.
 
