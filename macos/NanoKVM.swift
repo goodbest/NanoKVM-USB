@@ -109,10 +109,15 @@ struct Config {
     static let floatingChromeSize: CGFloat = 36
     static let floatingChromePositionXKey = "floatingChromePositionX"
     static let floatingChromePositionYKey = "floatingChromePositionY"
-    static let remoteTopEdgeTrigger: CGFloat = 48
-    static let remoteTopEdgeWarpInset: CGFloat = 256
-    static let remoteTopEdgeVirtualRelease: CGFloat = 96
-    static let remoteTopEdgeAlignmentTolerance: CGFloat = 2
+    static let remoteTopEdgeTrigger: CGFloat = 72
+    static let remoteTopEdgePredictionMultiplier: CGFloat = 2
+    static let remoteTopEdgeMaximumPrediction: CGFloat = 256
+    static let remoteTopEdgeRememberedMotionWeight: CGFloat = 0.65
+    static let remoteTopEdgeIntentMemory: TimeInterval = 0.04
+    static let remoteTopEdgeMinimumUpwardIntent: CGFloat = 0.25
+    static let remoteTopEdgePrimeTimeout: TimeInterval = 0.09
+    static let remoteTopEdgeMinimumRelease: CGFloat = 88
+    static let relativeTopEdgeRelease: CGFloat = 88
 }
 
 final class AudioRingBuffer {
@@ -175,6 +180,7 @@ class SerialPort {
     private let writeQueue = DispatchQueue(label: "com.nanokvm.serial", qos: .userInitiated)
     private var sendBuf = [UInt8](repeating: 0, count: 32)
     private var stats = SerialMetrics()
+    var onDisconnect: (() -> Void)?
     var isOpen: Bool { fd >= 0 }
     func open(path: String) -> Bool {
         fd = Darwin.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
@@ -239,7 +245,11 @@ class SerialPort {
             recordWrite(written, durationMs: elapsed)
             if written < 0 {
                 Darwin.close(self.fd); self.fd = -1
-                DispatchQueue.main.async { print("Serial: device disconnected") }
+                let onDisconnect = self.onDisconnect
+                DispatchQueue.main.async {
+                    print("Serial: device disconnected")
+                    onDisconnect?()
+                }
             }
         }
     }
@@ -1151,16 +1161,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     var preserveRemoteTopEdgeThroughBarrier = false
     var nativeChromeFocusGeneration = 0
     var remoteTopEdgeLatched = false
+    var remoteTopEdgeVirtualX: Double = 0
     var remoteTopEdgeVirtualY: Double = 0
-    var remoteTopEdgeWarpCutoff: TimeInterval = 0
-    var remoteTopEdgeExitAligning = false
+    var remoteTopEdgeVirtualReleaseDistance: CGFloat = 0
+    var remoteTopEdgePrimed = false
+    var remoteTopEdgePrimeGeneration = 0
+    var remoteTopEdgeHandoffCutoff: TimeInterval = 0
     var remoteTopEdgeExitReady = false
+    var remoteTopEdgeCursorDisassociated = false
+    var cursorAssociationRecoveryPending = false
+    var cursorAssociationRecoveryScheduled = false
+    var cursorAssociationRecoveryGeneration = 0
+    var relativeTopEdgeActive = false
+    var relativeTopEdgePrimed = false
+    var relativeTopEdgePrimeGeneration = 0
+    var relativeTopEdgeAnchor = CGPoint.zero
+    var relativeTopEdgeOffset = CGPoint.zero
+    var lastRemoteTopEdgeUpwardMotion: CGFloat = 0
+    var lastRemoteTopEdgeUpwardMotionAt: TimeInterval = 0
     let configuredToolbarWindows = NSHashTable<NSWindow>.weakObjects()
     var toolbarCursorRestoreScheduled = false
     var toolbarReturnPosition: (Double, Double)?
     var fullscreenToolbarPointerActive = false
     var mouseInputBarrierUntil: TimeInterval = 0
     var mouseInputBarrierWaitsForButtonsUp = false
+    var cursorAssociationSafetyObservers: [NSObjectProtocol] = []
+    var cursorAssociationScreenObserver: NSObjectProtocol?
 
     // MARK: - Lifecycle
 
@@ -1205,7 +1231,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         setupSerial(); setupCapture(); setupWindow()
         setupMouseMonitor()
         setupKeyboardMonitor()
+        setupCursorAssociationSafetyObservers()
         if serial.isOpen { startMouseFlush() }
+    }
+
+    func setupCursorAssociationSafetyObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        let names: [Notification.Name] = [
+            NSWorkspace.sessionDidResignActiveNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification,
+            NSWorkspace.screensDidSleepNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.willSleepNotification,
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.activeSpaceDidChangeNotification
+        ]
+        cursorAssociationSafetyObservers = names.map { name in
+            center.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.resetRemoteTopEdgeState()
+            }
+        }
+        cursorAssociationScreenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.resetRemoteTopEdgeState()
+        }
+    }
+
+    func removeCursorAssociationSafetyObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        for observer in cursorAssociationSafetyObservers {
+            center.removeObserver(observer)
+        }
+        cursorAssociationSafetyObservers.removeAll()
+        if let cursorAssociationScreenObserver {
+            NotificationCenter.default.removeObserver(cursorAssociationScreenObserver)
+            self.cursorAssociationScreenObserver = nil
+        }
     }
 
     func loadInputPreferences() {
@@ -1363,7 +1431,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         keyCode == 0x37 || keyCode == 0x36
     }
 
-    func beginHostShortcutPassthrough(_ event: NSEvent) {
+    @discardableResult
+    func beginHostShortcutPassthrough(_ event: NSEvent) -> Bool {
+        guard showSystemCursorIfHidden() else { return false }
         isPasting = false
         localChromeFocusActive = true
         let useControl = isNativeFullscreenChromeShortcut(event)
@@ -1385,7 +1455,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         releaseMouseButtons()
         setMouseInsideVideo(false)
         toolbarReturnPosition = nil
-        showSystemCursorIfHidden()
+        return true
     }
 
     func endLocalChromeFocus() {
@@ -1494,7 +1564,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         if event.type == .keyDown, nativeChromeShortcut {
             if !hostPassthroughKeyCodes.contains(event.keyCode) {
-                beginHostShortcutPassthrough(event)
+                guard beginHostShortcutPassthrough(event) else { return nil }
             }
             return event
         }
@@ -1530,7 +1600,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         if event.type == .keyDown, isLocalCommandShortcut(event) {
             if !hostPassthroughKeyCodes.contains(event.keyCode) {
-                beginHostShortcutPassthrough(event)
+                guard beginHostShortcutPassthrough(event) else { return nil }
             }
             return event
         }
@@ -1615,8 +1685,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func handleLocalMouseEvent(_ event: NSEvent) {
         guard window != nil, videoView != nil else { return }
         reconcileHostPassthroughModifiers(with: NSEvent.modifierFlags)
+        reconcileLocalChromeFocusForMainWindowMouseEvent(event)
         let topEdgeMotionAlreadyAccumulated =
             accumulateRemoteTopEdgeMotionWhileInputIsSuppressed(event)
+        let canObserveTopEdge = canObserveRemoteTopEdgeForMainWindowEvent()
+        if event.window === window,
+           canObserveTopEdge,
+           !localChromeFocusActive {
+            updateRemoteTopEdgeLatch(
+                for: event,
+                virtualMotionAlreadyAccumulated: topEdgeMotionAlreadyAccumulated)
+        }
         if localChromeFocusActive, isMouseButtonOrDragEvent(event) {
             scheduleNativeChromeFocusReconciliation()
         }
@@ -1631,9 +1710,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             showSystemCursorIfHidden()
             return
         }
-        updateRemoteTopEdgeLatch(
-            for: event,
-            virtualMotionAlreadyAccumulated: topEdgeMotionAlreadyAccumulated)
         let viewLoc = videoView.convert(event.locationInWindow, from: nil)
         let insideWithTolerance = window.styleMask.contains(.fullScreen) &&
             tolerantRemotePosition(viewLoc) != nil
@@ -1646,6 +1722,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             return
         }
         _ = prepareMouseEvent(event, viewLoc: viewLoc)
+    }
+
+    func canObserveRemoteTopEdgeForMainWindowEvent() -> Bool {
+        guard NSApp.isActive,
+              !pendingFloatingChromeActivation else { return false }
+        if window.isKeyWindow { return true }
+        if preserveRemoteTopEdgeThroughBarrier,
+           CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil {
+            return true
+        }
+        guard let keyWindow = NSApp.keyWindow else { return true }
+        let className = String(describing: type(of: keyWindow))
+        return className.contains("ToolbarFullScreenWindow") &&
+            !fullscreenToolbarHasKeyboardFocus() &&
+            !mainMenuHasKeyboardFocus()
+    }
+
+    func reconcileLocalChromeFocusForMainWindowMouseEvent(_ event: NSEvent) {
+        guard localChromeFocusActive,
+              !pendingFloatingChromeActivation,
+              event.window === window,
+              window.styleMask.contains(.fullScreen),
+              !fullscreenToolbarHasKeyboardFocus(),
+              !mainMenuHasKeyboardFocus() else { return }
+        endLocalChromeFocus()
+        preserveRemoteTopEdgeThroughBarrier = true
     }
 
     func handleGlobalMouseEvent(_ event: NSEvent) {
@@ -1691,6 +1793,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             !(NSEvent.pressedMouseButtons == 0 && !isMouseButtonOrDragEvent(event))
         let timeStillBlocks = CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil
         guard buttonsStillBlock || timeStillBlocks else { return false }
+        remoteTopEdgeVirtualX = min(
+            1,
+            max(0, remoteTopEdgeVirtualX + Double(event.deltaX * rRectInvW)))
         remoteTopEdgeVirtualY = min(
             1,
             max(0, remoteTopEdgeVirtualY + Double(event.deltaY * rRectInvH)))
@@ -1699,22 +1804,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func shouldSuppressMouseInput(_ event: NSEvent) -> Bool {
         let pressedButtons = NSEvent.pressedMouseButtons
-        if mouseInputBarrierWaitsForButtonsUp {
-            if pressedButtons == 0 && !isMouseButtonOrDragEvent(event) {
-                mouseInputBarrierWaitsForButtonsUp = false
-            } else {
-                leaveVideoInputRegion(
-                    event,
-                    preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
-                showSystemCursorIfHidden()
-                return true
-            }
+        if mouseInputBarrierWaitsForButtonsUp,
+           pressedButtons == 0,
+           !isMouseButtonOrDragEvent(event) {
+            mouseInputBarrierWaitsForButtonsUp = false
         }
-        if CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil {
+        let barrierStillBlocks = mouseInputBarrierWaitsForButtonsUp ||
+            CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil
+        if barrierStillBlocks,
+           event.window === window,
+           !localChromeFocusActive,
+           remoteTopEdgeLatched || relativeTopEdgeActive,
+           isRemoteTopEdgeMotionEvent(event) || isMouseButtonOrDragEvent(event) {
+            cancelPendingMouseMotion()
+            setMouseInsideVideo(true)
+            return true
+        }
+        if mouseInputBarrierWaitsForButtonsUp {
+            let preserveTopEdge = event.window === window &&
+                shouldPreserveRemoteTopEdge(for: event)
             leaveVideoInputRegion(
                 event,
-                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
-            showSystemCursorIfHidden()
+                preserveRemoteTopEdge: preserveTopEdge)
+            if !preserveTopEdge {
+                showSystemCursorIfHidden()
+            }
+            return true
+        }
+        if CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil {
+            let preserveTopEdge = event.window === window &&
+                shouldPreserveRemoteTopEdge(for: event)
+            leaveVideoInputRegion(
+                event,
+                preserveRemoteTopEdge: preserveTopEdge)
+            if !preserveTopEdge {
+                showSystemCursorIfHidden()
+            }
             return true
         }
         mouseInputBarrierUntil = 0
@@ -1722,6 +1847,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             preserveRemoteTopEdgeThroughBarrier = false
         }
         return false
+    }
+
+    func isRemoteTopEdgeMotionEvent(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            return true
+        default:
+            return false
+        }
     }
 
     func isMouseButtonOrDragEvent(_ event: NSEvent) -> Bool {
@@ -1754,14 +1888,91 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func resetAbsoluteRemoteTopEdgeState() {
         remoteTopEdgeLatched = false
+        remoteTopEdgeVirtualX = 0
         remoteTopEdgeVirtualY = 0
-        remoteTopEdgeExitAligning = false
+        remoteTopEdgeVirtualReleaseDistance = 0
+        remoteTopEdgePrimed = false
+        remoteTopEdgePrimeGeneration &+= 1
         remoteTopEdgeExitReady = false
     }
 
-    func resetRemoteTopEdgeState() {
+    func resetRelativeRemoteTopEdgeState() {
+        relativeTopEdgeActive = false
+        relativeTopEdgePrimed = false
+        relativeTopEdgePrimeGeneration &+= 1
+        relativeTopEdgeAnchor = .zero
+        relativeTopEdgeOffset = .zero
+    }
+
+    func resetRemoteTopEdgePredictionHistory() {
+        lastRemoteTopEdgeUpwardMotion = 0
+        lastRemoteTopEdgeUpwardMotionAt = 0
+    }
+
+    @discardableResult
+    func disassociateMouseCursorForRemoteTopEdge() -> Bool {
+        if remoteTopEdgeCursorDisassociated {
+            return !cursorAssociationRecoveryPending
+        }
+        guard !cursorAssociationRecoveryPending,
+              NSApp.isActive,
+              CGAssociateMouseAndMouseCursorPosition(0) == .success else { return false }
+        cursorAssociationRecoveryGeneration &+= 1
+        remoteTopEdgeCursorDisassociated = true
+        return true
+    }
+
+    @discardableResult
+    func restoreMouseCursorAssociation() -> Bool {
+        guard remoteTopEdgeCursorDisassociated else {
+            cursorAssociationRecoveryPending = false
+            return true
+        }
+        guard CGAssociateMouseAndMouseCursorPosition(1) == .success else {
+            cursorAssociationRecoveryPending = true
+            scheduleCursorAssociationRecovery()
+            return false
+        }
+        cursorAssociationRecoveryGeneration &+= 1
+        remoteTopEdgeCursorDisassociated = false
+        cursorAssociationRecoveryPending = false
+        cursorAssociationRecoveryScheduled = false
+        return true
+    }
+
+    func scheduleCursorAssociationRecovery() {
+        guard remoteTopEdgeCursorDisassociated,
+              !cursorAssociationRecoveryScheduled else { return }
+        cursorAssociationRecoveryScheduled = true
+        let generation = cursorAssociationRecoveryGeneration
+        let delay = NSApp.isActive ? 0.1 : 0.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard generation == cursorAssociationRecoveryGeneration else { return }
+            cursorAssociationRecoveryScheduled = false
+            guard cursorAssociationRecoveryPending,
+                  remoteTopEdgeCursorDisassociated else { return }
+            _ = restoreMouseCursorAssociation()
+        }
+    }
+
+    @discardableResult
+    func prepareRemoteTopEdgeForLocalUI() -> Bool {
+        let restored = restoreMouseCursorAssociation()
         resetAbsoluteRemoteTopEdgeState()
-        remoteTopEdgeWarpCutoff = 0
+        resetRelativeRemoteTopEdgeState()
+        resetRemoteTopEdgePredictionHistory()
+        remoteTopEdgeHandoffCutoff = 0
+        preserveRemoteTopEdgeThroughBarrier = false
+        return restored
+    }
+
+    func resetRemoteTopEdgeState() {
+        _ = restoreMouseCursorAssociation()
+        resetAbsoluteRemoteTopEdgeState()
+        resetRelativeRemoteTopEdgeState()
+        resetRemoteTopEdgePredictionHistory()
+        remoteTopEdgeHandoffCutoff = 0
         preserveRemoteTopEdgeThroughBarrier = false
     }
 
@@ -1781,54 +1992,179 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             Double(min(rRect.height, max(0, ly)) * rRectInvH))
     }
 
-    func recordRemoteTopEdgeWarp() {
-        remoteTopEdgeWarpCutoff = ProcessInfo.processInfo.systemUptime
+    func predictiveRemoteTopEdgeTrigger(
+        for event: NSEvent,
+        screen: NSScreen,
+        displayBounds: CGRect
+    ) -> (distance: CGFloat, hasUpwardIntent: Bool) {
+        guard screen.frame.height > 0 else {
+            return (Config.remoteTopEdgeTrigger, false)
+        }
+        let physicalScale = displayBounds.height / screen.frame.height
+        let upwardMotion = max(0, -event.deltaY * physicalScale)
+        let rememberedMotionIsFresh = lastRemoteTopEdgeUpwardMotionAt > 0 &&
+            event.timestamp >= lastRemoteTopEdgeUpwardMotionAt &&
+            event.timestamp - lastRemoteTopEdgeUpwardMotionAt <=
+                Config.remoteTopEdgeIntentMemory
+        let rememberedMotion = rememberedMotionIsFresh
+            ? lastRemoteTopEdgeUpwardMotion *
+                Config.remoteTopEdgeRememberedMotionWeight
+            : 0
+        let effectiveUpwardMotion = max(upwardMotion, rememberedMotion)
+        let minimumIntent = Config.remoteTopEdgeMinimumUpwardIntent * physicalScale
+        let hasUpwardIntent = upwardMotion >= minimumIntent ||
+            (rememberedMotionIsFresh &&
+                rememberedMotion >= minimumIntent &&
+                event.deltaY <= 0)
+        if upwardMotion > 0 {
+            lastRemoteTopEdgeUpwardMotion = upwardMotion
+            lastRemoteTopEdgeUpwardMotionAt = event.timestamp
+        } else if event.deltaY > 0 {
+            lastRemoteTopEdgeUpwardMotion = 0
+            lastRemoteTopEdgeUpwardMotionAt = 0
+        }
+        let prediction = min(
+            Config.remoteTopEdgeMaximumPrediction,
+            effectiveUpwardMotion * Config.remoteTopEdgePredictionMultiplier)
+        return (
+            Config.remoteTopEdgeTrigger + prediction,
+            hasUpwardIntent)
     }
 
-    func warpPointerAwayFromRemoteTop(
-        point: CGPoint,
+    func recordRemoteTopEdgeHandoff() {
+        remoteTopEdgeHandoffCutoff = ProcessInfo.processInfo.systemUptime
+    }
+
+    func markAbsoluteRemoteTopEdgeHandoffReady() {
+        resetRemoteTopEdgePredictionHistory()
+        remoteTopEdgeExitReady = true
+        DispatchQueue.main.async { [weak self] in
+            guard self?.remoteTopEdgeExitReady == true else { return }
+            self?.resetRemoteTopEdgeState()
+        }
+    }
+
+    func scheduleAbsoluteRemoteTopEdgePrimeTimeout(
+        displayID: CGDirectDisplayID,
+        screen: NSScreen,
         displayBounds: CGRect
     ) {
-        recordRemoteTopEdgeWarp()
-        CGWarpMouseCursorPosition(CGPoint(
-            x: min(displayBounds.maxX - 1, max(displayBounds.minX + 1, point.x)),
-            y: displayBounds.minY + Config.remoteTopEdgeWarpInset))
+        remoteTopEdgePrimeGeneration &+= 1
+        let generation = remoteTopEdgePrimeGeneration
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Config.remoteTopEdgePrimeTimeout
+        ) { [weak self, screen] in
+            guard let self,
+                  generation == remoteTopEdgePrimeGeneration,
+                  remoteTopEdgeLatched,
+                  remoteTopEdgePrimed else { return }
+            remoteTopEdgePrimed = false
+            if alignPointerWithRemoteTopState(
+                displayID: displayID,
+                screen: screen,
+                displayBounds: displayBounds) {
+                markAbsoluteRemoteTopEdgeHandoffReady()
+            } else {
+                resetRemoteTopEdgeState()
+            }
+        }
     }
 
-    func quartzY(
-        forRemoteY remoteY: Double,
+    func scheduleRelativeRemoteTopEdgePrimeTimeout(
+        displayID: CGDirectDisplayID,
+        displayBounds: CGRect
+    ) {
+        relativeTopEdgePrimeGeneration &+= 1
+        let generation = relativeTopEdgePrimeGeneration
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Config.remoteTopEdgePrimeTimeout
+        ) { [weak self] in
+            guard let self,
+                  generation == relativeTopEdgePrimeGeneration,
+                  relativeTopEdgeActive,
+                  relativeTopEdgePrimed else { return }
+            relativeTopEdgePrimed = false
+            if !finishRelativeTopEdgeCapture(
+                displayID: displayID,
+                displayBounds: displayBounds) {
+                resetRemoteTopEdgeState()
+            }
+        }
+    }
+
+    func quartzPoint(
+        forRemoteX remoteX: Double,
+        remoteY: Double,
         screen: NSScreen,
-        displayBounds: CGRect,
-        viewX: CGFloat
-    ) -> CGFloat? {
-        guard screen.frame.height > 0 else { return nil }
+        displayBounds: CGRect
+    ) -> CGPoint? {
+        guard screen.frame.width > 0, screen.frame.height > 0 else { return nil }
+        let targetPx = rRect.minX + CGFloat(remoteX) * rRect.width
         let targetPy = rRect.minY + CGFloat(remoteY) * rRect.height
         let targetViewPoint = NSPoint(
-            x: viewX,
+            x: targetPx,
             y: videoView.bounds.height - targetPy)
         let targetWindowPoint = videoView.convert(targetViewPoint, to: nil)
         let targetScreenPoint = window.convertPoint(toScreen: targetWindowPoint)
+        let normalizedFromLeft = min(
+            1,
+            max(0, (targetScreenPoint.x - screen.frame.minX) / screen.frame.width))
         let normalizedFromBottom = min(
             1,
             max(0, (targetScreenPoint.y - screen.frame.minY) / screen.frame.height))
-        return displayBounds.maxY - normalizedFromBottom * displayBounds.height
+        return CGPoint(
+            x: displayBounds.minX + normalizedFromLeft * displayBounds.width,
+            y: displayBounds.maxY - normalizedFromBottom * displayBounds.height)
     }
 
+    @discardableResult
     func alignPointerWithRemoteTopState(
-        point: CGPoint,
-        viewPoint: NSPoint,
+        displayID: CGDirectDisplayID,
         screen: NSScreen,
         displayBounds: CGRect
-    ) {
-        guard let targetY = quartzY(
-            forRemoteY: remoteTopEdgeVirtualY,
+    ) -> Bool {
+        guard let target = quartzPoint(
+            forRemoteX: remoteTopEdgeVirtualX,
+            remoteY: remoteTopEdgeVirtualY,
             screen: screen,
-            displayBounds: displayBounds,
-            viewX: viewPoint.x) else { return }
-        recordRemoteTopEdgeWarp()
-        CGWarpMouseCursorPosition(CGPoint(
-            x: min(displayBounds.maxX - 1, max(displayBounds.minX + 1, point.x)),
-            y: min(displayBounds.maxY - 1, max(displayBounds.minY + 1, targetY))))
+            displayBounds: displayBounds),
+              disassociateMouseCursorForRemoteTopEdge() else { return false }
+        let clampedTarget = CGPoint(
+            x: min(displayBounds.maxX - 1, max(displayBounds.minX + 1, target.x)),
+            y: min(displayBounds.maxY - 1, max(displayBounds.minY + 1, target.y)))
+        recordRemoteTopEdgeHandoff()
+        let moved = CGDisplayMoveCursorToPoint(
+            displayID,
+            CGPoint(
+                x: clampedTarget.x - displayBounds.minX,
+                y: clampedTarget.y - displayBounds.minY)) == .success
+        let restored = restoreMouseCursorAssociation()
+        return moved && restored
+    }
+
+    @discardableResult
+    func finishRelativeTopEdgeCapture(
+        displayID: CGDirectDisplayID,
+        displayBounds: CGRect
+    ) -> Bool {
+        guard relativeTopEdgeActive else { return true }
+        let target = CGPoint(
+            x: min(
+                displayBounds.maxX - 1,
+                max(displayBounds.minX + 1, relativeTopEdgeAnchor.x + relativeTopEdgeOffset.x)),
+            y: min(
+                displayBounds.maxY - 1,
+                max(displayBounds.minY + 1, relativeTopEdgeAnchor.y + relativeTopEdgeOffset.y)))
+        recordRemoteTopEdgeHandoff()
+        let moved = CGDisplayMoveCursorToPoint(
+            displayID,
+            CGPoint(
+                x: target.x - displayBounds.minX,
+                y: target.y - displayBounds.minY)) == .success
+        let restored = restoreMouseCursorAssociation()
+        resetRelativeRemoteTopEdgeState()
+        resetRemoteTopEdgePredictionHistory()
+        return moved && restored
     }
 
     func updateRemoteTopEdgeLatch(
@@ -1841,7 +2177,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         default:
             return
         }
-        guard NSApp.isActive,
+        guard serial.isOpen,
+              !isResizing,
+              !cursorAssociationRecoveryPending,
+              NSApp.isActive,
               window.styleMask.contains(.fullScreen),
               event.window === window,
               let screen = window.screen,
@@ -1851,7 +2190,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             resetRemoteTopEdgeState()
             return
         }
-        let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
+        let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+        let displayBounds = CGDisplayBounds(displayID)
         let point = cgEvent.location
         let distanceFromTop = point.y - displayBounds.minY
         guard point.x >= displayBounds.minX - 1,
@@ -1879,84 +2219,156 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             resetRemoteTopEdgeState()
             return
         }
+        let captureDecision = predictiveRemoteTopEdgeTrigger(
+            for: event,
+            screen: screen,
+            displayBounds: displayBounds)
 
         if !Config.mouseAbsolute {
             resetAbsoluteRemoteTopEdgeState()
-            guard !localChromeFocusActive else { return }
-            guard distanceFromTop <= Config.remoteTopEdgeTrigger,
-                  event.timestamp > remoteTopEdgeWarpCutoff else { return }
+            if localChromeFocusActive {
+                prepareRemoteTopEdgeForLocalUI()
+                return
+            }
+            if relativeTopEdgeActive {
+                relativeTopEdgeOffset.x += event.deltaX
+                let topOffset = displayBounds.minY + 1 - relativeTopEdgeAnchor.y
+                relativeTopEdgeOffset.y = max(
+                    topOffset,
+                    relativeTopEdgeOffset.y + event.deltaY)
+                let virtualDistanceFromTop = relativeTopEdgeAnchor.y +
+                    relativeTopEdgeOffset.y - displayBounds.minY
+                if relativeTopEdgePrimed {
+                    if virtualDistanceFromTop <= Config.remoteTopEdgeTrigger {
+                        relativeTopEdgePrimed = false
+                        relativeTopEdgePrimeGeneration &+= 1
+                    } else if event.deltaY < -Config.remoteTopEdgeMinimumUpwardIntent {
+                        scheduleRelativeRemoteTopEdgePrimeTimeout(
+                            displayID: displayID,
+                            displayBounds: displayBounds)
+                    } else if event.deltaY > Config.remoteTopEdgeMinimumUpwardIntent {
+                        if !finishRelativeTopEdgeCapture(
+                            displayID: displayID,
+                            displayBounds: displayBounds) {
+                            resetRemoteTopEdgeState()
+                        }
+                    }
+                    return
+                }
+                if virtualDistanceFromTop >= Config.relativeTopEdgeRelease,
+                   event.deltaY > 0 {
+                    if !finishRelativeTopEdgeCapture(
+                        displayID: displayID,
+                        displayBounds: displayBounds) {
+                        resetRemoteTopEdgeState()
+                    }
+                }
+                return
+            }
+            guard distanceFromTop <= captureDecision.distance,
+                  captureDecision.hasUpwardIntent,
+                  event.timestamp > remoteTopEdgeHandoffCutoff else { return }
+            guard disassociateMouseCursorForRemoteTopEdge() else { return }
             toolbarReturnPosition = nil
-            warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
+            relativeTopEdgeActive = true
+            relativeTopEdgePrimed = distanceFromTop > Config.remoteTopEdgeTrigger
+            relativeTopEdgeAnchor = point
+            relativeTopEdgeOffset = .zero
+            setMouseInsideVideo(true)
+            if relativeTopEdgePrimed {
+                scheduleRelativeRemoteTopEdgePrimeTimeout(
+                    displayID: displayID,
+                    displayBounds: displayBounds)
+            }
             return
         }
 
+        resetRelativeRemoteTopEdgeState()
         if !remoteTopEdgeLatched {
             guard !localChromeFocusActive else { return }
-            guard distanceFromTop <= Config.remoteTopEdgeTrigger else {
+            guard distanceFromTop <= captureDecision.distance,
+                  captureDecision.hasUpwardIntent,
+                  event.timestamp > remoteTopEdgeHandoffCutoff else {
                 return
             }
+            guard disassociateMouseCursorForRemoteTopEdge() else { return }
             remoteTopEdgeLatched = true
+            remoteTopEdgeVirtualX = directPosition.0
             remoteTopEdgeVirtualY = directPosition.1
-            remoteTopEdgeExitAligning = false
+            remoteTopEdgePrimed = distanceFromTop > Config.remoteTopEdgeTrigger
+            remoteTopEdgeVirtualReleaseDistance = min(
+                rRect.height,
+                Config.remoteTopEdgeMinimumRelease)
             remoteTopEdgeExitReady = false
             toolbarReturnPosition = nil
-            warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
+            setMouseInsideVideo(true)
+            if remoteTopEdgePrimed {
+                scheduleAbsoluteRemoteTopEdgePrimeTimeout(
+                    displayID: displayID,
+                    screen: screen,
+                    displayBounds: displayBounds)
+            }
             return
         }
 
         toolbarReturnPosition = nil
+        if localChromeFocusActive {
+            _ = prepareRemoteTopEdgeForLocalUI()
+            return
+        }
+        if remoteTopEdgeExitReady { return }
+        if !remoteTopEdgeCursorDisassociated {
+            guard disassociateMouseCursorForRemoteTopEdge() else {
+                resetRemoteTopEdgeState()
+                return
+            }
+            return
+        }
         if !virtualMotionAlreadyAccumulated {
+            remoteTopEdgeVirtualX = min(
+                1,
+                max(0, remoteTopEdgeVirtualX + Double(event.deltaX * rRectInvW)))
             remoteTopEdgeVirtualY = min(
                 1,
                 max(0, remoteTopEdgeVirtualY + Double(event.deltaY * rRectInvH)))
         }
-        guard !localChromeFocusActive else { return }
 
         let virtualDistance = CGFloat(remoteTopEdgeVirtualY) * rRect.height
-        if remoteTopEdgeExitAligning {
-            if virtualDistance < Config.remoteTopEdgeVirtualRelease {
-                remoteTopEdgeExitAligning = false
-                remoteTopEdgeExitReady = false
-                if distanceFromTop <= Config.remoteTopEdgeTrigger,
-                   event.timestamp > remoteTopEdgeWarpCutoff {
-                    warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
-                }
-                return
-            }
-            let tolerance = Double(Config.remoteTopEdgeAlignmentTolerance * rRectInvH)
-            if event.timestamp > remoteTopEdgeWarpCutoff,
-               abs(directPosition.1 - remoteTopEdgeVirtualY) <= tolerance {
-                remoteTopEdgeExitAligning = false
-                remoteTopEdgeExitReady = true
-                DispatchQueue.main.async { [weak self] in
-                    guard self?.remoteTopEdgeExitReady == true else { return }
-                    self?.resetRemoteTopEdgeState()
-                }
-            } else if event.timestamp > remoteTopEdgeWarpCutoff {
-                alignPointerWithRemoteTopState(
-                    point: point,
-                    viewPoint: viewPoint,
+        if remoteTopEdgePrimed {
+            if virtualDistance <= Config.remoteTopEdgeTrigger {
+                remoteTopEdgePrimed = false
+                remoteTopEdgePrimeGeneration &+= 1
+            } else if event.deltaY < -Config.remoteTopEdgeMinimumUpwardIntent {
+                scheduleAbsoluteRemoteTopEdgePrimeTimeout(
+                    displayID: displayID,
                     screen: screen,
                     displayBounds: displayBounds)
+            } else if event.deltaY > Config.remoteTopEdgeMinimumUpwardIntent {
+                remoteTopEdgePrimed = false
+                remoteTopEdgePrimeGeneration &+= 1
+                if alignPointerWithRemoteTopState(
+                    displayID: displayID,
+                    screen: screen,
+                    displayBounds: displayBounds) {
+                    markAbsoluteRemoteTopEdgeHandoffReady()
+                } else {
+                    resetRemoteTopEdgeState()
+                }
             }
             return
         }
 
-        if virtualDistance >= Config.remoteTopEdgeVirtualRelease {
-            remoteTopEdgeExitAligning = true
-            if event.timestamp > remoteTopEdgeWarpCutoff {
-                alignPointerWithRemoteTopState(
-                    point: point,
-                    viewPoint: viewPoint,
-                    screen: screen,
-                    displayBounds: displayBounds)
+        if virtualDistance >= remoteTopEdgeVirtualReleaseDistance {
+            if alignPointerWithRemoteTopState(
+                displayID: displayID,
+                screen: screen,
+                displayBounds: displayBounds) {
+                markAbsoluteRemoteTopEdgeHandoffReady()
+            } else {
+                resetRemoteTopEdgeState()
             }
             return
         }
-
-        guard distanceFromTop <= Config.remoteTopEdgeTrigger,
-              event.timestamp > remoteTopEdgeWarpCutoff else { return }
-        warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
     }
 
     func isEventOverFullscreenToolbar(_ event: NSEvent) -> Bool {
@@ -2147,6 +2559,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func setupSerial() {
+        serial.onDisconnect = { [weak self] in
+            guard let self, !serial.isOpen else { return }
+            resetRemoteTopEdgeState()
+            stopMouseFlush()
+            releaseAll()
+            currentSerialPath = nil
+            syncCursorVisibility()
+        }
         guard let port = findSerialPorts().first else { print("No serial port. Video only."); return }
         print("Serial: " + port)
         if serial.open(path: port) {
@@ -2581,23 +3001,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         floatingChromePanel?.orderOut(nil)
     }
 
-    func prepareForFloatingChromeInteraction(preserveRemoteTopEdge: Bool) {
+    @discardableResult
+    func prepareForFloatingChromeInteraction(
+        preserveRemoteTopEdge: Bool
+    ) -> Bool {
         if !preserveRemoteTopEdge {
             resetRemoteTopEdgeState()
         }
+        guard showSystemCursorIfHidden() else { return false }
         toolbarReturnPosition = nil
         releaseAll()
         beginMouseInputBarrier(duration: 0.18, waitForButtonsUp: true)
-        showSystemCursorIfHidden()
+        return true
     }
 
     func floatingChromeWillDrag() {
-        prepareForFloatingChromeInteraction(preserveRemoteTopEdge: false)
+        _ = prepareForFloatingChromeInteraction(preserveRemoteTopEdge: false)
     }
 
     @objc func activateNativeFullscreenControls() {
+        guard prepareForFloatingChromeInteraction(
+            preserveRemoteTopEdge: true) else {
+            endLocalChromeFocus()
+            pendingFloatingChromeActivation = false
+            return
+        }
         localChromeFocusActive = true
-        prepareForFloatingChromeInteraction(preserveRemoteTopEdge: true)
         pendingFloatingChromeActivation = true
         if !NSApp.isActive {
             NSApp.activate(ignoringOtherApps: true)
@@ -2755,7 +3184,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
               NSApp.isActive,
               window.styleMask.contains(.fullScreen),
               event.window === window else { return position }
-        let virtualPosition = (position.0, remoteTopEdgeVirtualY)
+        let virtualPosition = (remoteTopEdgeVirtualX, remoteTopEdgeVirtualY)
         if remoteTopEdgeExitReady {
             resetRemoteTopEdgeState()
         }
@@ -2809,7 +3238,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
-    func showSystemCursorIfHidden() {
+    @discardableResult
+    func showSystemCursorIfHidden() -> Bool {
+        let associationRestored = prepareRemoteTopEdgeForLocalUI()
         let wasHidden = cursorActuallyHidden
         cursorActuallyHidden = false
         if wasHidden {
@@ -2817,6 +3248,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         NSCursor.arrow.set()
         scheduleToolbarCursorRestore()
+        return associationRestored
     }
 
     func scheduleToolbarCursorRestore() {
@@ -2864,7 +3296,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func flushMouse() {
-        guard serial.isOpen else { return }
+        guard serial.isOpen else {
+            resetRemoteTopEdgeState()
+            stopMouseFlush()
+            return
+        }
         guard !handleFullscreenToolbarAtCurrentMouseLocation() else { return }
         guard mouseInsideVideo else {
             cancelPendingMouseMotion()
@@ -2908,6 +3344,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // MARK: - Window Delegate
 
     func windowWillStartLiveResize(_ n: Notification) {
+        resetRemoteTopEdgeState()
         isResizing = true
         releaseAll()
         syncCursorVisibility()
@@ -2925,6 +3362,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return [.fullScreen, .autoHideMenuBar, .autoHideToolbar]
     }
     func windowWillEnterFullScreen(_ n: Notification) {
+        resetRemoteTopEdgeState()
         endLocalChromeFocus()
         hideFloatingChromeControl()
         releaseAll()
@@ -2938,6 +3376,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
     func windowWillExitFullScreen(_ n: Notification) {
+        resetRemoteTopEdgeState()
         endLocalChromeFocus()
         pendingFloatingChromeActivation = false
         hideFloatingChromeControl()
@@ -2973,6 +3412,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
     func windowDidChangeOcclusionState(_ n: Notification) {
         if !isWindowVisibleForMonitoring() {
+            resetRemoteTopEdgeState()
             sessionWatchdog?.cancel()
             sessionWatchdog = nil
             showTransitionResumeShield()
@@ -3021,7 +3461,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func windowDidBecomeKey(_ n: Notification) {
-        if remoteTopEdgeLatched || remoteTopEdgeWarpCutoff > 0 {
+        if window.styleMask.contains(.fullScreen) {
             preserveRemoteTopEdgeThroughBarrier = true
         }
         if !pendingFloatingChromeActivation {
@@ -3708,6 +4148,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func windowWillClose(_ n: Notification) {
+        resetRemoteTopEdgeState()
+        removeCursorAssociationSafetyObservers()
         Config.cursorHiddenPreferred = false
         hideFloatingChromeControl()
         showSystemCursorIfHidden()
@@ -3735,6 +4177,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         NSApp.terminate(nil)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { true }
+    func applicationWillResignActive(_ notification: Notification) {
+        resetRemoteTopEdgeState()
+    }
     func applicationDidResignActive(_ notification: Notification) {
         endLocalChromeFocus()
         pendingFloatingChromeActivation = false
@@ -3742,8 +4187,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         handleInactiveWindowTransition()
     }
     func applicationDidBecomeActive(_ notification: Notification) {
+        resetRemoteTopEdgeState()
+        if window.styleMask.contains(.fullScreen) {
+            preserveRemoteTopEdgeThroughBarrier = true
+        }
         beginMouseInputBarrier(duration: 0.25, waitForButtonsUp: true)
         syncCursorVisibility()
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        resetRemoteTopEdgeState()
+        removeCursorAssociationSafetyObservers()
     }
 
     // MARK: - Toolbar Setup
@@ -4547,6 +5000,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc func serialPortSelected(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
+        resetRemoteTopEdgeState()
         stopMouseFlush()
         releaseAll()
         serial.close()
@@ -4564,6 +5018,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc func disconnectSerial(_ sender: Any?) {
+        resetRemoteTopEdgeState()
         stopMouseFlush()
         releaseAll()
         serial.close()
