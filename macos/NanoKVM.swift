@@ -1,6 +1,7 @@
 import AppKit
 import AudioToolbox
 import AVFoundation
+import CoreGraphics
 import CoreMedia
 import CoreImage
 import VideoToolbox
@@ -105,6 +106,13 @@ struct Config {
     static let foregroundResumeRevealDelay: TimeInterval = 0.45
     static let foregroundResumeFramesRequired = 3
     static let foregroundResumeWatchdogInterval: TimeInterval = 3.0
+    static let floatingChromeSize: CGFloat = 36
+    static let floatingChromePositionXKey = "floatingChromePositionX"
+    static let floatingChromePositionYKey = "floatingChromePositionY"
+    static let remoteTopEdgeTrigger: CGFloat = 48
+    static let remoteTopEdgeWarpInset: CGFloat = 256
+    static let remoteTopEdgeVirtualRelease: CGFloat = 96
+    static let remoteTopEdgeAlignmentTolerance: CGFloat = 2
 }
 
 final class AudioRingBuffer {
@@ -732,18 +740,33 @@ class VideoView: NSView {
     // MARK: - Keyboard
 
     override func keyDown(with event: NSEvent) {
-        guard let app = app, app.serial.isOpen, !app.isResizing else { return }
+        guard let app else { return }
+        if app.shouldPassKeyboardEventToHostFromVideoView(event) {
+            super.keyDown(with: event)
+            return
+        }
+        guard app.serial.isOpen, !app.isResizing else { return }
         if event.modifierFlags.contains(.command) { return }
         if let h = hidForKey(event.keyCode) { app.serial.sendKeyboard(app.kb.keyDown(h)) }
     }
 
     override func keyUp(with event: NSEvent) {
-        guard let app = app, app.serial.isOpen, !app.isResizing else { return }
+        guard let app else { return }
+        if app.shouldPassKeyboardEventToHostFromVideoView(event) {
+            super.keyUp(with: event)
+            return
+        }
+        guard app.serial.isOpen, !app.isResizing else { return }
         if let h = hidForKey(event.keyCode) { app.serial.sendKeyboard(app.kb.keyUp(h)) }
     }
 
     override func flagsChanged(with event: NSEvent) {
-        guard let app = app, app.serial.isOpen, !app.isResizing else { return }
+        guard let app else { return }
+        if app.shouldPassKeyboardEventToHostFromVideoView(event) {
+            super.flagsChanged(with: event)
+            return
+        }
+        guard app.serial.isOpen, !app.isResizing else { return }
         if (event.keyCode == 0x37 || event.keyCode == 0x36) &&
             !app.shouldCaptureKeyboardEvent(event) { return }
         if let h = hidForKey(event.keyCode) {
@@ -761,7 +784,7 @@ class VideoView: NSView {
         guard app.prepareMouseEvent(event, viewLoc: viewLoc) else { return }
         guard app.serial.isOpen, !app.isResizing else { return }
         if Config.mouseAbsolute {
-            if let pos = pixelToNorm(viewLoc.x, bounds.height - viewLoc.y, app.rRect, app.rRectInvW, app.rRectInvH) {
+            if let pos = app.remoteAbsolutePosition(for: event, viewLoc: viewLoc) {
                 app.lastPos = pos; app.pendingMove = pos
             }
         } else {
@@ -782,7 +805,10 @@ class VideoView: NSView {
         _ = app.prepareMouseEvent(event, viewLoc: viewLoc)
     }
     override func mouseExited(with event: NSEvent) {
-        app?.leaveVideoInputRegion(event)
+        guard let app else { return }
+        app.leaveVideoInputRegion(
+            event,
+            preserveRemoteTopEdge: app.shouldPreserveRemoteTopEdge(for: event))
     }
 
     // MARK: - Mouse down / up
@@ -792,10 +818,13 @@ class VideoView: NSView {
         let viewLoc = convert(event.locationInWindow, from: nil)
         app.recordMouseEvent(kind: "button")
         guard app.prepareMouseEvent(event, viewLoc: viewLoc) else { return }
+        app.endLocalChromeFocus()
+        app.window.makeFirstResponder(self)
         guard app.serial.isOpen, !app.isResizing else { return }
+        app.flushDeferredHostModifiersToRemote()
         app.mouse.buttonDown(event.buttonNumber)
         if Config.mouseAbsolute {
-            if let pos = pixelToNorm(viewLoc.x, bounds.height - viewLoc.y, app.rRect, app.rRectInvW, app.rRectInvH) {
+            if let pos = app.remoteAbsolutePosition(for: event, viewLoc: viewLoc) {
                 app.lastPos = pos
             }
             app.serial.sendMouseAbsolute(app.mouse.build(nx: app.lastPos.0, ny: app.lastPos.1))
@@ -828,6 +857,7 @@ class VideoView: NSView {
         guard let app = app, app.serial.isOpen, !app.isResizing else { return }
         let viewLoc = convert(event.locationInWindow, from: nil)
         guard app.prepareMouseEvent(event, viewLoc: viewLoc) else { return }
+        app.flushDeferredHostModifiersToRemote()
         app.recordMouseEvent(kind: "wheel")
         app.scrollAccum += event.scrollingDeltaY * Config.scrollSpeed * Double(Config.scrollDirection)
         let s = Int(app.scrollAccum)
@@ -840,6 +870,161 @@ class VideoView: NSView {
             app.serial.sendMouseRelative(app.mouse.buildRelative(dx: 0, dy: 0, scroll: clamped))
         }
         app.recordMouseReport()
+    }
+}
+
+final class FloatingChromePanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+final class FloatingChromeControl: NSButton {
+    weak var app: AppDelegate?
+    private var trackingAreaRef: NSTrackingArea?
+    private var isHovered = false
+    private var isPressed = false
+    private var isDraggingControl = false
+    private var mouseDownScreenPoint = NSPoint.zero
+    private var panelOriginAtMouseDown = NSPoint.zero
+
+    override var acceptsFirstResponder: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard let app else { return false }
+        app.activateNativeFullscreenControls()
+        return true
+    }
+
+    @objc private func performPrimaryAction(_ sender: Any?) {
+        app?.activateNativeFullscreenControls()
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        isBordered = false
+        title = ""
+        focusRingType = .none
+        setButtonType(.momentaryChange)
+        target = self
+        action = #selector(performPrimaryAction(_:))
+        toolTip = "Show Local Controls"
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Show NanoKVM menu bar and toolbar")
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        if let trackingAreaRef { removeTrackingArea(trackingAreaRef) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil)
+        addTrackingArea(area)
+        trackingAreaRef = area
+        super.updateTrackingAreas()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: isDraggingControl ? .closedHand : .pointingHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let panel = window else { return }
+        mouseDownScreenPoint = NSEvent.mouseLocation
+        panelOriginAtMouseDown = panel.frame.origin
+        isPressed = true
+        isDraggingControl = false
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let app else { return }
+        let mousePoint = NSEvent.mouseLocation
+        let dx = mousePoint.x - mouseDownScreenPoint.x
+        let dy = mousePoint.y - mouseDownScreenPoint.y
+        if !isDraggingControl, hypot(dx, dy) >= 6 {
+            isDraggingControl = true
+            app.floatingChromeWillDrag()
+            window?.invalidateCursorRects(for: self)
+        }
+        guard isDraggingControl else { return }
+        app.moveFloatingChromePanel(to: NSPoint(
+            x: panelOriginAtMouseDown.x + dx,
+            y: panelOriginAtMouseDown.y + dy))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let wasDragging = isDraggingControl
+        isPressed = false
+        isDraggingControl = false
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+        if wasDragging {
+            app?.saveFloatingChromePosition()
+        } else {
+            performPrimaryAction(self)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let context = NSGraphicsContext.current else { return }
+        let circleRect = bounds.insetBy(dx: 4, dy: 4)
+        let path = NSBezierPath(ovalIn: circleRect)
+        context.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.28)
+        shadow.shadowBlurRadius = 5
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.set()
+        let fillAlpha: CGFloat = isPressed ? 0.68 : (isHovered ? 0.52 : 0.36)
+        NSColor.black.withAlphaComponent(fillAlpha).setFill()
+        path.fill()
+        context.restoreGraphicsState()
+
+        NSColor.white.withAlphaComponent(isHovered ? 0.38 : 0.2).setStroke()
+        path.lineWidth = 0.75
+        path.stroke()
+
+        let iconAlpha: CGFloat = isPressed ? 1 : (isHovered ? 0.92 : 0.72)
+        let configuration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [
+                NSColor.white.withAlphaComponent(iconAlpha)
+            ]))
+        let symbol = (NSImage(
+            systemSymbolName: "rectangle.topthird.inset.filled",
+            accessibilityDescription: nil) ?? NSImage(
+                systemSymbolName: "chevron.up",
+                accessibilityDescription: nil))?.withSymbolConfiguration(configuration)
+        let iconRect = NSRect(
+            x: bounds.midX - 8,
+            y: bounds.midY - 8,
+            width: 16,
+            height: 16)
+        symbol?.draw(
+            in: iconRect,
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1,
+            respectFlipped: true,
+            hints: nil)
     }
 }
 
@@ -956,6 +1141,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     var localKeyboardMonitor: Any?
     var capturedKeyCodes = Set<UInt16>()
     var capturedModifierStates: [UInt16: Bool] = [:]
+    var deferredHostModifierKeyCodes = Set<UInt16>()
+    var hostPassthroughKeyCodes = Set<UInt16>()
+    var hostPassthroughModifierKeyCodes = Set<UInt16>()
+    var floatingChromePanel: FloatingChromePanel?
+    var floatingChromeControl: FloatingChromeControl?
+    var pendingFloatingChromeActivation = false
+    var localChromeFocusActive = false
+    var preserveRemoteTopEdgeThroughBarrier = false
+    var nativeChromeFocusGeneration = 0
+    var remoteTopEdgeLatched = false
+    var remoteTopEdgeVirtualY: Double = 0
+    var remoteTopEdgeWarpCutoff: TimeInterval = 0
+    var remoteTopEdgeExitAligning = false
+    var remoteTopEdgeExitReady = false
     let configuredToolbarWindows = NSHashTable<NSWindow>.weakObjects()
     var toolbarCursorRestoreScheduled = false
     var toolbarReturnPosition: (Double, Double)?
@@ -1069,7 +1268,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func setupKeyboardMonitor() {
         localKeyboardMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
-            self?.handleLocalKeyboardEvent(event) ?? event
+            guard let self else { return event }
+            return self.handleLocalKeyboardEvent(event)
+        }
+    }
+
+    func isFullscreenHostShortcutContext() -> Bool {
+        NSApp.isActive &&
+            window?.isKeyWindow == true &&
+            window?.styleMask.contains(.fullScreen) == true
+    }
+
+    func isNativeFullscreenChromeShortcutContext() -> Bool {
+        guard NSApp.isActive,
+              window?.styleMask.contains(.fullScreen) == true else { return false }
+        return window.isKeyWindow ||
+            localChromeFocusActive ||
+            fullscreenToolbarWindows().contains { $0.isKeyWindow }
+    }
+
+    func shouldRouteKeyboardInputToRemote(_ event: NSEvent) -> Bool {
+        guard serial.isOpen,
+              !isResizing,
+              !localChromeFocusActive,
+              isFullscreenHostShortcutContext(),
+              event.window == nil || event.window === window,
+              window.firstResponder === videoView else { return false }
+        return mouseInsideVideo && !isEventOverFullscreenToolbar(event)
+    }
+
+    func reconcileHostPassthroughModifiers(with flags: NSEvent.ModifierFlags) {
+        let independentFlags = flags.intersection(.deviceIndependentFlagsMask)
+        if !independentFlags.contains(.control) {
+            hostPassthroughModifierKeyCodes = Set(hostPassthroughModifierKeyCodes.filter {
+                !isControlKeyCode($0)
+            })
+        }
+        if !independentFlags.contains(.command) {
+            hostPassthroughModifierKeyCodes = Set(hostPassthroughModifierKeyCodes.filter {
+                !isCommandKeyCode($0)
+            })
         }
     }
 
@@ -1077,27 +1315,267 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard Config.keyboardCaptureHostShortcuts,
               serial.isOpen,
               !isResizing,
-              NSApp.isActive,
-              window?.isKeyWindow == true,
-              window?.styleMask.contains(.fullScreen) == true else { return false }
+              isFullscreenHostShortcutContext() else { return false }
         if capturedKeyCodes.contains(event.keyCode) ||
             capturedModifierStates[event.keyCode] != nil {
             return true
         }
-        return mouseInsideVideo && !isEventOverFullscreenToolbar(event)
+        guard hostPassthroughModifierKeyCodes.isEmpty else { return false }
+        return shouldRouteKeyboardInputToRemote(event)
     }
 
-    func shouldKeepHostShortcut(_ event: NSEvent) -> Bool {
-        guard event.type == .keyDown,
-              event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-        else { return false }
-        return event.keyCode == 0x03 // Command+F: local fullscreen toggle
+    func normalizedHostShortcutFlags(_ event: NSEvent) -> NSEvent.ModifierFlags {
+        event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+    }
+
+    func isNativeFullscreenChromeKeyCombination(_ event: NSEvent) -> Bool {
+        guard event.keyCode == 0x78 || event.keyCode == 0x60 else { return false }
+        return normalizedHostShortcutFlags(event) == [.control]
+    }
+
+    func isNativeFullscreenChromeShortcut(_ event: NSEvent) -> Bool {
+        isNativeFullscreenChromeShortcutContext() &&
+            isNativeFullscreenChromeKeyCombination(event)
+    }
+
+    func isLocalCommandKeyCombination(_ event: NSEvent) -> Bool {
+        guard event.keyCode == 0x03 || event.keyCode == 0x0C else { return false }
+        return normalizedHostShortcutFlags(event) == [.command]
+    }
+
+    func isLocalCommandShortcut(_ event: NSEvent) -> Bool {
+        isFullscreenHostShortcutContext() && isLocalCommandKeyCombination(event)
+    }
+
+    func isDeferredHostModifierKey(_ keyCode: UInt16) -> Bool {
+        if keyCode == 0x3B || keyCode == 0x3E { return true } // Control
+        return Config.keyboardCaptureHostShortcuts &&
+            (keyCode == 0x37 || keyCode == 0x36) // Command
+    }
+
+    func isControlKeyCode(_ keyCode: UInt16) -> Bool {
+        keyCode == 0x3B || keyCode == 0x3E
+    }
+
+    func isCommandKeyCode(_ keyCode: UInt16) -> Bool {
+        keyCode == 0x37 || keyCode == 0x36
+    }
+
+    func beginHostShortcutPassthrough(_ event: NSEvent) {
+        isPasting = false
+        localChromeFocusActive = true
+        let useControl = isNativeFullscreenChromeShortcut(event)
+        if useControl {
+            scheduleNativeChromeFocusReconciliation()
+        }
+        let capturedModifiers = Set(capturedModifierStates.keys)
+        let relevantModifiers = deferredHostModifierKeyCodes.union(capturedModifiers).filter {
+            useControl ? isControlKeyCode($0) : isCommandKeyCode($0)
+        }
+        hostPassthroughModifierKeyCodes.formUnion(relevantModifiers)
+        hostPassthroughKeyCodes.insert(event.keyCode)
+        let passthroughKeyCode = event.keyCode
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.hostPassthroughKeyCodes.remove(passthroughKeyCode)
+        }
+        releaseRemoteKeyboardState()
+        cancelPendingMouseMotion()
+        releaseMouseButtons()
+        setMouseInsideVideo(false)
+        toolbarReturnPosition = nil
+        showSystemCursorIfHidden()
+    }
+
+    func endLocalChromeFocus() {
+        nativeChromeFocusGeneration &+= 1
+        localChromeFocusActive = false
+    }
+
+    func fullscreenToolbarHasKeyboardFocus() -> Bool {
+        for toolbarWindow in fullscreenToolbarWindows() {
+            let screenFrame = toolbarWindow.screen?.frame ?? window.screen?.frame
+            let visiblyPresented = toolbarWindow.isVisible &&
+                toolbarWindow.alphaValue > 0.01 &&
+                screenFrame.map { !toolbarWindow.frame.intersection($0).isEmpty } == true
+            guard toolbarWindow.isKeyWindow || visiblyPresented,
+                  let contentView = toolbarWindow.contentView,
+                  let toolbarView = findToolbarView(in: contentView),
+                  let responder = toolbarWindow.firstResponder as? NSView else { continue }
+            if responder === toolbarView || responder.isDescendant(of: toolbarView) {
+                return true
+            }
+        }
+        return false
+    }
+
+    func mainMenuHasKeyboardFocus() -> Bool {
+        if NSApp.mainMenu?.highlightedItem != nil { return true }
+        if NSApp.mainMenu?.isAccessibilityFocused() == true { return true }
+        if let menuBar = NSApp.accessibilityMenuBar() as? NSMenu,
+           menuBar.isAccessibilityFocused() {
+            return true
+        }
+        guard let focused = NSApplication.shared.accessibilityFocusedUIElement else { return false }
+        return focused is NSMenu || focused is NSMenuItem
+    }
+
+    func scheduleNativeChromeFocusReconciliation() {
+        nativeChromeFocusGeneration &+= 1
+        reconcileNativeChromeFocus(
+            generation: nativeChromeFocusGeneration,
+            remainingAttempts: 4,
+            delay: 0.06)
+    }
+
+    func reconcileNativeChromeFocus(
+        generation: Int,
+        remainingAttempts: Int,
+        delay: TimeInterval
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  generation == nativeChromeFocusGeneration else { return }
+            guard NSApp.isActive,
+                  window.styleMask.contains(.fullScreen) else {
+                endLocalChromeFocus()
+                return
+            }
+            if fullscreenToolbarHasKeyboardFocus() || mainMenuHasKeyboardFocus() {
+                localChromeFocusActive = true
+                reconcileNativeChromeFocus(
+                    generation: generation,
+                    remainingAttempts: 4,
+                    delay: 0.18)
+                return
+            }
+            if remainingAttempts > 1 {
+                reconcileNativeChromeFocus(
+                    generation: generation,
+                    remainingAttempts: remainingAttempts - 1,
+                    delay: 0.06)
+            } else if !pendingFloatingChromeActivation {
+                endLocalChromeFocus()
+            }
+        }
+    }
+
+    func flushDeferredHostModifiersToRemote() {
+        guard !deferredHostModifierKeyCodes.isEmpty else { return }
+        let keyCodes = deferredHostModifierKeyCodes.sorted()
+        deferredHostModifierKeyCodes.removeAll()
+        for keyCode in keyCodes {
+            guard let hid = hidForKey(keyCode) else { continue }
+            capturedModifierStates[keyCode] = true
+            if serial.isOpen { serial.sendKeyboard(kb.keyDown(hid)) }
+            else { _ = kb.keyDown(hid) }
+        }
+    }
+
+    func shouldPassKeyboardEventToHostFromVideoView(_ event: NSEvent) -> Bool {
+        localChromeFocusActive ||
+            event.keyCode == 0x3F ||
+            hostPassthroughKeyCodes.contains(event.keyCode) ||
+            hostPassthroughModifierKeyCodes.contains(event.keyCode) ||
+            isNativeFullscreenChromeKeyCombination(event) ||
+            isLocalCommandKeyCombination(event)
     }
 
     func handleLocalKeyboardEvent(_ event: NSEvent) -> NSEvent? {
+        let nativeChromeShortcut = isNativeFullscreenChromeShortcut(event)
+        if event.type != .flagsChanged {
+            reconcileHostPassthroughModifiers(with: event.modifierFlags)
+        }
+
+        if event.keyCode == 0x3F { // Fn / Globe always belongs to macOS.
+            return event
+        }
+
+        if event.type == .keyDown, nativeChromeShortcut {
+            if !hostPassthroughKeyCodes.contains(event.keyCode) {
+                beginHostShortcutPassthrough(event)
+            }
+            return event
+        }
+
+        if hostPassthroughKeyCodes.contains(event.keyCode) {
+            if event.type == .keyUp {
+                DispatchQueue.main.async { [weak self] in
+                    self?.hostPassthroughKeyCodes.remove(event.keyCode)
+                }
+            }
+            return event
+        }
+
+        if event.type == .keyUp, nativeChromeShortcut {
+            return event
+        }
+
+        if event.type == .flagsChanged,
+           hostPassthroughModifierKeyCodes.contains(event.keyCode) {
+            if !modifierIsDown(for: event.keyCode, flags: event.modifierFlags) {
+                DispatchQueue.main.async { [weak self] in
+                    self?.hostPassthroughModifierKeyCodes.remove(event.keyCode)
+                }
+            }
+            return event
+        }
+
+        if localChromeFocusActive, event.type == .keyDown {
+            scheduleNativeChromeFocusReconciliation()
+        }
+
+        guard isFullscreenHostShortcutContext() else { return event }
+
+        if event.type == .keyDown, isLocalCommandShortcut(event) {
+            if !hostPassthroughKeyCodes.contains(event.keyCode) {
+                beginHostShortcutPassthrough(event)
+            }
+            return event
+        }
+
+        if event.type == .keyUp, isLocalCommandShortcut(event) {
+            return event
+        }
+
+        if event.type == .flagsChanged,
+           isDeferredHostModifierKey(event.keyCode) {
+            let isDown = modifierIsDown(for: event.keyCode, flags: event.modifierFlags)
+            if isDown {
+                if shouldRouteKeyboardInputToRemote(event) {
+                    deferredHostModifierKeyCodes.insert(event.keyCode)
+                    return nil
+                }
+                hostPassthroughModifierKeyCodes.insert(event.keyCode)
+                return event
+            } else if deferredHostModifierKeyCodes.remove(event.keyCode) != nil {
+                if let hid = hidForKey(event.keyCode) {
+                    if serial.isOpen {
+                        serial.sendKeyboard(kb.keyDown(hid))
+                        serial.sendKeyboard(kb.keyUp(hid))
+                    } else {
+                        _ = kb.keyDown(hid)
+                        _ = kb.keyUp(hid)
+                    }
+                }
+            } else if capturedModifierStates.removeValue(forKey: event.keyCode) != nil,
+                      let hid = hidForKey(event.keyCode) {
+                if serial.isOpen { serial.sendKeyboard(kb.keyUp(hid)) }
+                else { _ = kb.keyUp(hid) }
+            }
+            return nil
+        }
+
+        if event.type == .keyUp,
+           deferredHostModifierKeyCodes.isEmpty,
+           !capturedKeyCodes.contains(event.keyCode),
+           hostPassthroughModifierKeyCodes.isEmpty {
+            return event
+        }
+        if event.type == .keyDown { flushDeferredHostModifiersToRemote() }
         guard shouldCaptureKeyboardEvent(event) else { return event }
-        guard !shouldKeepHostShortcut(event) else { return event }
-        guard let hid = hidForKey(event.keyCode) else { return nil }
+        guard let hid = hidForKey(event.keyCode) else { return event }
 
         switch event.type {
         case .keyDown:
@@ -1122,32 +1600,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return nil
     }
 
-    func resetCapturedKeyboardState() {
-        guard !capturedKeyCodes.isEmpty || !capturedModifierStates.isEmpty else { return }
+    func releaseRemoteKeyboardState() {
         capturedKeyCodes.removeAll()
         capturedModifierStates.removeAll()
-        if serial.isOpen {
-            serial.sendKeyboard(kb.releaseAll())
-        }
+        deferredHostModifierKeyCodes.removeAll()
+        let report = kb.releaseAll()
+        if serial.isOpen { serial.sendKeyboard(report) }
+    }
+
+    func resetCapturedKeyboardState() {
+        releaseRemoteKeyboardState()
     }
 
     func handleLocalMouseEvent(_ event: NSEvent) {
         guard window != nil, videoView != nil else { return }
+        reconcileHostPassthroughModifiers(with: NSEvent.modifierFlags)
+        let topEdgeMotionAlreadyAccumulated =
+            accumulateRemoteTopEdgeMotionWhileInputIsSuppressed(event)
+        if localChromeFocusActive, isMouseButtonOrDragEvent(event) {
+            scheduleNativeChromeFocusReconciliation()
+        }
         if shouldSuppressMouseInput(event) {
             return
         }
         guard event.window === window else {
-            leaveVideoInputRegion(event)
+            leaveVideoInputRegion(
+                event,
+                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
             enforceFullscreenToolbarCursor(on: event.window)
             showSystemCursorIfHidden()
             return
         }
-        guard isWindowPointInsideVideoContent(event.locationInWindow) else {
-            leaveVideoInputRegion(event)
+        updateRemoteTopEdgeLatch(
+            for: event,
+            virtualMotionAlreadyAccumulated: topEdgeMotionAlreadyAccumulated)
+        let viewLoc = videoView.convert(event.locationInWindow, from: nil)
+        let insideWithTolerance = window.styleMask.contains(.fullScreen) &&
+            tolerantRemotePosition(viewLoc) != nil
+        guard isWindowPointInsideVideoContent(event.locationInWindow) ||
+                insideWithTolerance else {
+            leaveVideoInputRegion(
+                event,
+                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
             showSystemCursorIfHidden()
             return
         }
-        let viewLoc = videoView.convert(event.locationInWindow, from: nil)
         _ = prepareMouseEvent(event, viewLoc: viewLoc)
     }
 
@@ -1179,23 +1676,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             (waitForButtonsUp && NSEvent.pressedMouseButtons != 0)
     }
 
+    func accumulateRemoteTopEdgeMotionWhileInputIsSuppressed(_ event: NSEvent) -> Bool {
+        guard Config.mouseAbsolute,
+              remoteTopEdgeLatched,
+              localChromeFocusActive || preserveRemoteTopEdgeThroughBarrier,
+              event.window === window else { return false }
+        switch event.type {
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            break
+        default:
+            return false
+        }
+        let buttonsStillBlock = mouseInputBarrierWaitsForButtonsUp &&
+            !(NSEvent.pressedMouseButtons == 0 && !isMouseButtonOrDragEvent(event))
+        let timeStillBlocks = CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil
+        guard buttonsStillBlock || timeStillBlocks else { return false }
+        remoteTopEdgeVirtualY = min(
+            1,
+            max(0, remoteTopEdgeVirtualY + Double(event.deltaY * rRectInvH)))
+        return true
+    }
+
     func shouldSuppressMouseInput(_ event: NSEvent) -> Bool {
         let pressedButtons = NSEvent.pressedMouseButtons
         if mouseInputBarrierWaitsForButtonsUp {
             if pressedButtons == 0 && !isMouseButtonOrDragEvent(event) {
                 mouseInputBarrierWaitsForButtonsUp = false
             } else {
-                leaveVideoInputRegion(event)
+                leaveVideoInputRegion(
+                    event,
+                    preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
                 showSystemCursorIfHidden()
                 return true
             }
         }
         if CFAbsoluteTimeGetCurrent() < mouseInputBarrierUntil {
-            leaveVideoInputRegion(event)
+            leaveVideoInputRegion(
+                event,
+                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
             showSystemCursorIfHidden()
             return true
         }
         mouseInputBarrierUntil = 0
+        if !localChromeFocusActive {
+            preserveRemoteTopEdgeThroughBarrier = false
+        }
         return false
     }
 
@@ -1212,6 +1737,226 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func eventScreenPoint(_ event: NSEvent) -> NSPoint {
         event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+    }
+
+    func shouldPreserveRemoteTopEdge(for event: NSEvent? = nil) -> Bool {
+        guard NSApp.isActive,
+              window.styleMask.contains(.fullScreen) else { return false }
+        if localChromeFocusActive || preserveRemoteTopEdgeThroughBarrier {
+            return true
+        }
+        guard let panel = floatingChromePanel,
+              panel.isVisible else { return false }
+        if event?.window === panel { return true }
+        let point = event.map(eventScreenPoint) ?? NSEvent.mouseLocation
+        return panel.frame.insetBy(dx: -1, dy: -1).contains(point)
+    }
+
+    func resetAbsoluteRemoteTopEdgeState() {
+        remoteTopEdgeLatched = false
+        remoteTopEdgeVirtualY = 0
+        remoteTopEdgeExitAligning = false
+        remoteTopEdgeExitReady = false
+    }
+
+    func resetRemoteTopEdgeState() {
+        resetAbsoluteRemoteTopEdgeState()
+        remoteTopEdgeWarpCutoff = 0
+        preserveRemoteTopEdgeThroughBarrier = false
+    }
+
+    func tolerantRemotePosition(_ viewPoint: NSPoint) -> (Double, Double)? {
+        guard rRect.width > 0, rRect.height > 0 else { return nil }
+        let px = viewPoint.x
+        let py = videoView.bounds.height - viewPoint.y
+        let lx = px - rRect.minX
+        let ly = py - rRect.minY
+        let tolerance: CGFloat = 1
+        guard lx >= -tolerance,
+              lx <= rRect.width + tolerance,
+              ly >= -tolerance,
+              ly <= rRect.height + tolerance else { return nil }
+        return (
+            Double(min(rRect.width, max(0, lx)) * rRectInvW),
+            Double(min(rRect.height, max(0, ly)) * rRectInvH))
+    }
+
+    func recordRemoteTopEdgeWarp() {
+        remoteTopEdgeWarpCutoff = ProcessInfo.processInfo.systemUptime
+    }
+
+    func warpPointerAwayFromRemoteTop(
+        point: CGPoint,
+        displayBounds: CGRect
+    ) {
+        recordRemoteTopEdgeWarp()
+        CGWarpMouseCursorPosition(CGPoint(
+            x: min(displayBounds.maxX - 1, max(displayBounds.minX + 1, point.x)),
+            y: displayBounds.minY + Config.remoteTopEdgeWarpInset))
+    }
+
+    func quartzY(
+        forRemoteY remoteY: Double,
+        screen: NSScreen,
+        displayBounds: CGRect,
+        viewX: CGFloat
+    ) -> CGFloat? {
+        guard screen.frame.height > 0 else { return nil }
+        let targetPy = rRect.minY + CGFloat(remoteY) * rRect.height
+        let targetViewPoint = NSPoint(
+            x: viewX,
+            y: videoView.bounds.height - targetPy)
+        let targetWindowPoint = videoView.convert(targetViewPoint, to: nil)
+        let targetScreenPoint = window.convertPoint(toScreen: targetWindowPoint)
+        let normalizedFromBottom = min(
+            1,
+            max(0, (targetScreenPoint.y - screen.frame.minY) / screen.frame.height))
+        return displayBounds.maxY - normalizedFromBottom * displayBounds.height
+    }
+
+    func alignPointerWithRemoteTopState(
+        point: CGPoint,
+        viewPoint: NSPoint,
+        screen: NSScreen,
+        displayBounds: CGRect
+    ) {
+        guard let targetY = quartzY(
+            forRemoteY: remoteTopEdgeVirtualY,
+            screen: screen,
+            displayBounds: displayBounds,
+            viewX: viewPoint.x) else { return }
+        recordRemoteTopEdgeWarp()
+        CGWarpMouseCursorPosition(CGPoint(
+            x: min(displayBounds.maxX - 1, max(displayBounds.minX + 1, point.x)),
+            y: min(displayBounds.maxY - 1, max(displayBounds.minY + 1, targetY))))
+    }
+
+    func updateRemoteTopEdgeLatch(
+        for event: NSEvent,
+        virtualMotionAlreadyAccumulated: Bool
+    ) {
+        switch event.type {
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            break
+        default:
+            return
+        }
+        guard NSApp.isActive,
+              window.styleMask.contains(.fullScreen),
+              event.window === window,
+              let screen = window.screen,
+              let screenNumber = screen.deviceDescription[
+                  NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              let cgEvent = event.cgEvent else {
+            resetRemoteTopEdgeState()
+            return
+        }
+        let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
+        let point = cgEvent.location
+        let distanceFromTop = point.y - displayBounds.minY
+        guard point.x >= displayBounds.minX - 1,
+              point.x <= displayBounds.maxX + 1,
+              distanceFromTop >= -1,
+              distanceFromTop <= displayBounds.height + 1 else {
+            resetRemoteTopEdgeState()
+            return
+        }
+
+        let viewPoint = videoView.convert(event.locationInWindow, from: nil)
+        guard let directPosition = tolerantRemotePosition(viewPoint) else {
+            resetRemoteTopEdgeState()
+            return
+        }
+
+        let appKitPoint = eventScreenPoint(event)
+        let hasScreenAbove = NSScreen.screens.contains { candidate in
+            candidate !== screen &&
+                abs(candidate.frame.minY - screen.frame.maxY) <= 1 &&
+                appKitPoint.x >= candidate.frame.minX &&
+                appKitPoint.x <= candidate.frame.maxX
+        }
+        if hasScreenAbove {
+            resetRemoteTopEdgeState()
+            return
+        }
+
+        if !Config.mouseAbsolute {
+            resetAbsoluteRemoteTopEdgeState()
+            guard !localChromeFocusActive else { return }
+            guard distanceFromTop <= Config.remoteTopEdgeTrigger,
+                  event.timestamp > remoteTopEdgeWarpCutoff else { return }
+            toolbarReturnPosition = nil
+            warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
+            return
+        }
+
+        if !remoteTopEdgeLatched {
+            guard !localChromeFocusActive else { return }
+            guard distanceFromTop <= Config.remoteTopEdgeTrigger else {
+                return
+            }
+            remoteTopEdgeLatched = true
+            remoteTopEdgeVirtualY = directPosition.1
+            remoteTopEdgeExitAligning = false
+            remoteTopEdgeExitReady = false
+            toolbarReturnPosition = nil
+            warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
+            return
+        }
+
+        toolbarReturnPosition = nil
+        if !virtualMotionAlreadyAccumulated {
+            remoteTopEdgeVirtualY = min(
+                1,
+                max(0, remoteTopEdgeVirtualY + Double(event.deltaY * rRectInvH)))
+        }
+        guard !localChromeFocusActive else { return }
+
+        let virtualDistance = CGFloat(remoteTopEdgeVirtualY) * rRect.height
+        if remoteTopEdgeExitAligning {
+            if virtualDistance < Config.remoteTopEdgeVirtualRelease {
+                remoteTopEdgeExitAligning = false
+                remoteTopEdgeExitReady = false
+                if distanceFromTop <= Config.remoteTopEdgeTrigger,
+                   event.timestamp > remoteTopEdgeWarpCutoff {
+                    warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
+                }
+                return
+            }
+            let tolerance = Double(Config.remoteTopEdgeAlignmentTolerance * rRectInvH)
+            if event.timestamp > remoteTopEdgeWarpCutoff,
+               abs(directPosition.1 - remoteTopEdgeVirtualY) <= tolerance {
+                remoteTopEdgeExitAligning = false
+                remoteTopEdgeExitReady = true
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.remoteTopEdgeExitReady == true else { return }
+                    self?.resetRemoteTopEdgeState()
+                }
+            } else if event.timestamp > remoteTopEdgeWarpCutoff {
+                alignPointerWithRemoteTopState(
+                    point: point,
+                    viewPoint: viewPoint,
+                    screen: screen,
+                    displayBounds: displayBounds)
+            }
+            return
+        }
+
+        if virtualDistance >= Config.remoteTopEdgeVirtualRelease {
+            remoteTopEdgeExitAligning = true
+            if event.timestamp > remoteTopEdgeWarpCutoff {
+                alignPointerWithRemoteTopState(
+                    point: point,
+                    viewPoint: viewPoint,
+                    screen: screen,
+                    displayBounds: displayBounds)
+            }
+            return
+        }
+
+        guard distanceFromTop <= Config.remoteTopEdgeTrigger,
+              event.timestamp > remoteTopEdgeWarpCutoff else { return }
+        warpPointerAwayFromRemoteTop(point: point, displayBounds: displayBounds)
     }
 
     func isEventOverFullscreenToolbar(_ event: NSEvent) -> Bool {
@@ -1240,9 +1985,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         scrollAccum = 0
     }
 
-    func leaveVideoInputRegion(_ event: NSEvent? = nil) {
+    func leaveVideoInputRegion(
+        _ event: NSEvent? = nil,
+        preserveRemoteTopEdge: Bool = false
+    ) {
         cancelPendingMouseMotion()
         setMouseInsideVideo(false)
+        if !preserveRemoteTopEdge {
+            resetRemoteTopEdgeState()
+        }
         if let event {
             if isEventOverFullscreenToolbar(event) {
                 restoreRemoteMouseAfterToolbarEntry()
@@ -1283,10 +2034,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func prepareMouseEvent(_ event: NSEvent, viewLoc: NSPoint) -> Bool {
         guard !shouldSuppressMouseInput(event) else { return false }
         guard !isEventOverFullscreenToolbar(event) else {
-            leaveVideoInputRegion(event)
+            leaveVideoInputRegion(
+                event,
+                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
             return false
         }
-        if isEventInFullscreenToolbarRevealZone(event) {
+        if remoteTopEdgeLatched {
+            toolbarReturnPosition = nil
+        } else if isEventInFullscreenToolbarRevealZone(event) {
             if toolbarReturnPosition == nil {
                 toolbarReturnPosition = lastPos
             }
@@ -1295,7 +2050,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         updateMouseInsideVideo(viewLoc)
         guard mouseInsideVideo else {
-            leaveVideoInputRegion(event)
+            leaveVideoInputRegion(
+                event,
+                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge(for: event))
             return false
         }
         return true
@@ -1703,6 +2460,233 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         recalcRect()
+        setupFloatingChromeControl()
+    }
+
+    func setupFloatingChromeControl() {
+        let size = NSSize(width: Config.floatingChromeSize, height: Config.floatingChromeSize)
+        let panel = FloatingChromePanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.worksWhenModal = true
+        panel.isMovable = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.title = "NanoKVM Local Controls"
+        panel.collectionBehavior = [.fullScreenAuxiliary, .transient, .ignoresCycle]
+        panel.animationBehavior = .none
+        panel.level = window.level
+
+        let control = FloatingChromeControl(frame: NSRect(origin: .zero, size: size))
+        control.app = self
+        panel.contentView = control
+        floatingChromePanel = panel
+        floatingChromeControl = control
+        window.addChildWindow(panel, ordered: .above)
+        restoreFloatingChromePosition()
+        panel.orderOut(nil)
+    }
+
+    func floatingChromeOriginLimits(on screen: NSScreen) ->
+        (minX: CGFloat, maxX: CGFloat, minY: CGFloat, maxY: CGFloat) {
+        let size = Config.floatingChromeSize
+        let safe = screen.safeAreaInsets
+        let margin: CGFloat = 8
+        let screenFrame = screen.frame
+        let windowFrame = window.styleMask.contains(.fullScreen) ? window.frame : screenFrame
+        let allowedFrame = screenFrame.intersection(windowFrame)
+        let minX = allowedFrame.minX + safe.left + margin
+        let maxX = max(minX, allowedFrame.maxX - safe.right - margin - size)
+        let minY = allowedFrame.minY + safe.bottom + margin
+        let maxY = max(minY, allowedFrame.maxY - safe.top - margin - size)
+        return (minX, maxX, minY, maxY)
+    }
+
+    func clampedFloatingChromeOrigin(_ origin: NSPoint, on screen: NSScreen) -> NSPoint {
+        let limits = floatingChromeOriginLimits(on: screen)
+        return NSPoint(
+            x: min(limits.maxX, max(limits.minX, origin.x)),
+            y: min(limits.maxY, max(limits.minY, origin.y)))
+    }
+
+    func defaultFloatingChromeOrigin(on screen: NSScreen) -> NSPoint {
+        let limits = floatingChromeOriginLimits(on: screen)
+        let centerY = screen.frame.minY + max(120, screen.frame.height * 0.18)
+        return clampedFloatingChromeOrigin(
+            NSPoint(x: limits.minX, y: centerY - Config.floatingChromeSize / 2),
+            on: screen)
+    }
+
+    func restoreFloatingChromePosition() {
+        guard let panel = floatingChromePanel,
+              let screen = window.screen else { return }
+        let defaults = UserDefaults.standard
+        let limits = floatingChromeOriginLimits(on: screen)
+        let origin: NSPoint
+        if let savedX = defaults.object(forKey: Config.floatingChromePositionXKey) as? NSNumber,
+           let savedY = defaults.object(forKey: Config.floatingChromePositionYKey) as? NSNumber {
+            let nx = min(1, max(0, CGFloat(savedX.doubleValue)))
+            let ny = min(1, max(0, CGFloat(savedY.doubleValue)))
+            origin = NSPoint(
+                x: limits.minX + nx * (limits.maxX - limits.minX),
+                y: limits.minY + ny * (limits.maxY - limits.minY))
+        } else {
+            origin = defaultFloatingChromeOrigin(on: screen)
+        }
+        panel.setFrameOrigin(clampedFloatingChromeOrigin(origin, on: screen))
+    }
+
+    func moveFloatingChromePanel(to origin: NSPoint) {
+        guard let panel = floatingChromePanel,
+              let screen = window.screen else { return }
+        panel.setFrameOrigin(clampedFloatingChromeOrigin(origin, on: screen))
+    }
+
+    func clampFloatingChromePositionToCurrentScreen() {
+        guard let panel = floatingChromePanel,
+              let screen = window.screen else { return }
+        panel.setFrameOrigin(clampedFloatingChromeOrigin(panel.frame.origin, on: screen))
+    }
+
+    func saveFloatingChromePosition() {
+        guard let panel = floatingChromePanel,
+              let screen = window.screen else { return }
+        let limits = floatingChromeOriginLimits(on: screen)
+        let origin = clampedFloatingChromeOrigin(panel.frame.origin, on: screen)
+        panel.setFrameOrigin(origin)
+        let xSpan = limits.maxX - limits.minX
+        let ySpan = limits.maxY - limits.minY
+        let nx = xSpan > 0 ? (origin.x - limits.minX) / xSpan : 0
+        let ny = ySpan > 0 ? (origin.y - limits.minY) / ySpan : 0
+        UserDefaults.standard.set(Double(nx), forKey: Config.floatingChromePositionXKey)
+        UserDefaults.standard.set(Double(ny), forKey: Config.floatingChromePositionYKey)
+    }
+
+    func showFloatingChromeControl() {
+        guard window.styleMask.contains(.fullScreen) else {
+            floatingChromePanel?.orderOut(nil)
+            return
+        }
+        restoreFloatingChromePosition()
+        floatingChromePanel?.orderFront(nil)
+    }
+
+    func hideFloatingChromeControl() {
+        floatingChromePanel?.orderOut(nil)
+    }
+
+    func prepareForFloatingChromeInteraction(preserveRemoteTopEdge: Bool) {
+        if !preserveRemoteTopEdge {
+            resetRemoteTopEdgeState()
+        }
+        toolbarReturnPosition = nil
+        releaseAll()
+        beginMouseInputBarrier(duration: 0.18, waitForButtonsUp: true)
+        showSystemCursorIfHidden()
+    }
+
+    func floatingChromeWillDrag() {
+        prepareForFloatingChromeInteraction(preserveRemoteTopEdge: false)
+    }
+
+    @objc func activateNativeFullscreenControls() {
+        localChromeFocusActive = true
+        prepareForFloatingChromeInteraction(preserveRemoteTopEdge: true)
+        pendingFloatingChromeActivation = true
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        if !window.isKeyWindow {
+            window.makeKeyAndOrderFront(nil)
+        }
+        scheduleFloatingChromeActivationAttempt(
+            remainingAttempts: 12)
+    }
+
+    func scheduleFloatingChromeActivationAttempt(remainingAttempts: Int) {
+        guard pendingFloatingChromeActivation else { return }
+        guard isFullscreenHostShortcutContext() else {
+            retryFloatingChromeActivation(remainingAttempts: remainingAttempts)
+            return
+        }
+        guard focusFullscreenToolbarWithoutMovingPointer() else {
+            retryFloatingChromeActivation(remainingAttempts: remainingAttempts)
+            return
+        }
+        pendingFloatingChromeActivation = false
+        scheduleNativeChromeFocusReconciliation()
+    }
+
+    func retryFloatingChromeActivation(remainingAttempts: Int) {
+        guard remainingAttempts > 0 else {
+            pendingFloatingChromeActivation = false
+            endLocalChromeFocus()
+            resetRemoteTopEdgeState()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.scheduleFloatingChromeActivationAttempt(
+                remainingAttempts: remainingAttempts - 1)
+        }
+    }
+
+    func focusFullscreenToolbarWithoutMovingPointer() -> Bool {
+        guard NSApp.isActive,
+              window.styleMask.contains(.fullScreen),
+              let targetScreen = window.screen else { return false }
+        window.toolbar?.isVisible = true
+        let screenFrame = targetScreen.frame
+        let toolbarWindow = fullscreenToolbarWindows().compactMap {
+            candidate -> (window: NSWindow, score: CGFloat)? in
+            let frame = candidate.frame
+            let horizontalOverlap = max(
+                0,
+                min(frame.maxX, screenFrame.maxX) - max(frame.minX, screenFrame.minX))
+            guard horizontalOverlap >= min(frame.width, screenFrame.width) * 0.75 else {
+                return nil
+            }
+            let screenTop = screenFrame.maxY
+            let topDistance = screenTop < frame.minY
+                ? frame.minY - screenTop
+                : (screenTop > frame.maxY ? screenTop - frame.maxY : 0)
+            guard topDistance <= max(8, frame.height + 8) else { return nil }
+            let score = topDistance + abs(frame.midX - screenFrame.midX) * 0.01
+            return (candidate, score)
+        }.min { $0.score < $1.score }?.window
+        guard let toolbarWindow else { return false }
+        enforceFullscreenToolbarCursor(on: toolbarWindow)
+        guard let contentView = toolbarWindow.contentView else {
+            return false
+        }
+        contentView.layoutSubtreeIfNeeded()
+        guard let toolbarView = findToolbarView(in: contentView),
+              let focusableView = toolbarView.canBecomeKeyView
+                ? toolbarView
+                : toolbarView.nextValidKeyView,
+              focusableView.window === toolbarWindow,
+              focusableView === toolbarView || focusableView.isDescendant(of: toolbarView)
+        else { return false }
+        guard toolbarWindow.makeFirstResponder(focusableView) else { return false }
+        toolbarWindow.makeKey()
+        return toolbarWindow.isKeyWindow
+    }
+
+    func findToolbarView(in view: NSView) -> NSView? {
+        if view.accessibilityRole() == .toolbar {
+            return view
+        }
+        for subview in view.subviews {
+            if let match = findToolbarView(in: subview) {
+                return match
+            }
+        }
+        return nil
     }
 
     func trimRecent(_ values: inout [TimeInterval], now: TimeInterval) {
@@ -1739,17 +2723,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func updateMouseInsideVideo(_ viewLoc: NSPoint) {
         let windowLoc = videoView.convert(viewLoc, to: nil)
-        guard isWindowPointInsideVideoContent(windowLoc) else {
-            leaveVideoInputRegion()
+        let insideWithTolerance = window.styleMask.contains(.fullScreen) &&
+            tolerantRemotePosition(viewLoc) != nil
+        guard isWindowPointInsideVideoContent(windowLoc) || insideWithTolerance else {
+            leaveVideoInputRegion(
+                preserveRemoteTopEdge: shouldPreserveRemoteTopEdge())
             return
         }
-        let inside = pixelToNorm(
-            viewLoc.x,
-            videoView.bounds.height - viewLoc.y,
-            rRect,
-            rRectInvW,
-            rRectInvH) != nil
+        let inside = insideWithTolerance || pixelToNorm(
+                viewLoc.x,
+                videoView.bounds.height - viewLoc.y,
+                rRect,
+                rRectInvW,
+                rRectInvH) != nil
         setMouseInsideVideo(inside)
+    }
+
+    func remoteAbsolutePosition(
+        for event: NSEvent,
+        viewLoc: NSPoint
+    ) -> (Double, Double)? {
+        guard let position = remoteTopEdgeLatched
+            ? tolerantRemotePosition(viewLoc)
+            : pixelToNorm(
+                viewLoc.x,
+                videoView.bounds.height - viewLoc.y,
+                rRect,
+                rRectInvW,
+                rRectInvH) else { return nil }
+        guard remoteTopEdgeLatched,
+              NSApp.isActive,
+              window.styleMask.contains(.fullScreen),
+              event.window === window else { return position }
+        let virtualPosition = (position.0, remoteTopEdgeVirtualY)
+        if remoteTopEdgeExitReady {
+            resetRemoteTopEdgeState()
+        }
+        return virtualPosition
     }
 
     func videoCursorRect(in view: NSView) -> NSRect {
@@ -1878,14 +2888,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func releaseAll() {
         isPasting = false
-        capturedKeyCodes.removeAll()
-        capturedModifierStates.removeAll()
-        guard serial.isOpen else { return }
-        serial.sendKeyboard(kb.releaseAll())
+        hostPassthroughKeyCodes.removeAll()
+        hostPassthroughModifierKeyCodes.removeAll()
+        releaseRemoteKeyboardState()
         releaseMouseButtons()
     }
 
     func recalcRect() {
+        resetRemoteTopEdgeState()
         guard let cv = window.contentView else { return }
         rRect = calcRenderRect(vw: videoW, vh: videoH, ww: cv.bounds.width, wh: cv.bounds.height)
         rRectInvW = rRect.width > 0 ? 1.0 / rRect.width : 0
@@ -1906,21 +2916,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         isResizing = false
         syncCursorVisibility()
     }
-    func windowDidResize(_ n: Notification) { recalcRect(); updateMouseLocationFromSystem() }
+    func windowDidResize(_ n: Notification) {
+        recalcRect()
+        clampFloatingChromePositionToCurrentScreen()
+        updateMouseLocationFromSystem()
+    }
     func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposed: NSApplication.PresentationOptions) -> NSApplication.PresentationOptions {
         return [.fullScreen, .autoHideMenuBar, .autoHideToolbar]
+    }
+    func windowWillEnterFullScreen(_ n: Notification) {
+        endLocalChromeFocus()
+        hideFloatingChromeControl()
+        releaseAll()
     }
     func windowDidEnterFullScreen(_ n: Notification) {
         recalcRect()
         updateMouseLocationFromSystem()
         DispatchQueue.main.async { [weak self] in
             self?.enforceFullscreenToolbarCursor()
+            self?.showFloatingChromeControl()
         }
     }
+    func windowWillExitFullScreen(_ n: Notification) {
+        endLocalChromeFocus()
+        pendingFloatingChromeActivation = false
+        hideFloatingChromeControl()
+        releaseAll()
+    }
+    func windowDidFailToExitFullScreen(_ window: NSWindow) {
+        showFloatingChromeControl()
+    }
     func windowDidExitFullScreen(_ n: Notification) {
+        endLocalChromeFocus()
         configuredToolbarWindows.removeAllObjects()
         toolbarReturnPosition = nil
         fullscreenToolbarPointerActive = false
+        resetRemoteTopEdgeState()
         recalcRect()
         updateMouseLocationFromSystem()
     }
@@ -1928,6 +2959,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         showTransitionResumeShield()
         previewLayer?.contentsScale = window.backingScaleFactor
         recalcRect()
+        clampFloatingChromePositionToCurrentScreen()
         updateMouseLocationFromSystem()
         resumeForegroundVideoAfterShield()
     }
@@ -1935,6 +2967,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         showTransitionResumeShield()
         previewLayer?.contentsScale = window.backingScaleFactor
         recalcRect()
+        restoreFloatingChromePosition()
         updateMouseLocationFromSystem()
         resumeForegroundVideoAfterShield()
     }
@@ -1946,7 +2979,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             scheduleInactiveWindowVideoPolicy()
             return
         }
-        if NSApp.isActive && window.isKeyWindow {
+        if isForegroundVideoWindow() {
             inactivePolicyWorkItem?.cancel()
             inactivePolicyWorkItem = nil
             refreshTimer?.invalidate()
@@ -1960,6 +2993,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         scheduleInactiveWindowVideoPolicy()
     }
     func windowDidResignKey(_ n: Notification) {
+        if localChromeFocusActive,
+           NSApp.isActive,
+           window.styleMask.contains(.fullScreen) {
+            inactivePolicyWorkItem?.cancel()
+            inactivePolicyWorkItem = nil
+            leaveVideoInputRegion(preserveRemoteTopEdge: true)
+            showSystemCursorIfHidden()
+            releaseAll()
+            return
+        }
+        handleInactiveWindowTransition()
+    }
+
+    func handleInactiveWindowTransition() {
         beginResumeShield()
         inactivePolicyWorkItem?.cancel()
         inactivePolicyWorkItem = nil
@@ -1974,6 +3021,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func windowDidBecomeKey(_ n: Notification) {
+        if remoteTopEdgeLatched || remoteTopEdgeWarpCutoff > 0 {
+            preserveRemoteTopEdgeThroughBarrier = true
+        }
+        if !pendingFloatingChromeActivation {
+            endLocalChromeFocus()
+        }
         inactivePolicyWorkItem?.cancel()
         inactivePolicyWorkItem = nil
         beginMouseInputBarrier(duration: 0.25, waitForButtonsUp: true)
@@ -2367,7 +3420,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func isForegroundVideoWindow() -> Bool {
-        NSApp.isActive && window.isKeyWindow && isWindowVisibleForMonitoring()
+        guard NSApp.isActive, isWindowVisibleForMonitoring() else { return false }
+        return window.isKeyWindow ||
+            (localChromeFocusActive && window.styleMask.contains(.fullScreen))
     }
 
     func shouldKeepInactiveVideoLive() -> Bool {
@@ -2654,6 +3709,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func windowWillClose(_ n: Notification) {
         Config.cursorHiddenPreferred = false
+        hideFloatingChromeControl()
         showSystemCursorIfHidden()
         if let localMouseMonitor {
             NSEvent.removeMonitor(localMouseMonitor)
@@ -2680,9 +3736,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { true }
     func applicationDidResignActive(_ notification: Notification) {
-        leaveVideoInputRegion()
+        endLocalChromeFocus()
+        pendingFloatingChromeActivation = false
         beginMouseInputBarrier(duration: 0.35, waitForButtonsUp: true)
-        showSystemCursorIfHidden()
+        handleInactiveWindowTransition()
     }
     func applicationDidBecomeActive(_ notification: Notification) {
         beginMouseInputBarrier(duration: 0.25, waitForButtonsUp: true)
@@ -2953,7 +4010,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             menuItem(sub, "Release All Keys", #selector(sendReleaseAll(_:)))
         }
         submenu(menu, "Shortcuts", icon: "command") { sub in
-            for title in ["Cmd+F  Fullscreen", "Cmd+Tab is reserved by macOS", "Use Option+Tab for Windows Alt+Tab"] {
+            for title in [
+                "Cmd+F  Fullscreen",
+                "Fn+Control+F2  macOS Menu Bar",
+                "Fn+Control+F5  NanoKVM Toolbar",
+                "Cmd+Tab is reserved by macOS",
+                "Use Option+Tab for Windows Alt+Tab"
+            ] {
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 sub.addItem(item)
@@ -3485,6 +4548,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc func serialPortSelected(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         stopMouseFlush()
+        releaseAll()
         serial.close()
         syncCursorVisibility()
         if serial.open(path: path) {
@@ -3501,6 +4565,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc func disconnectSerial(_ sender: Any?) {
         stopMouseFlush()
+        releaseAll()
         serial.close()
         currentSerialPath = nil
         lastInfoRaw = nil
@@ -3591,13 +4656,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc func setMouseAbsolute(_ sender: Any?) {
+        guard !Config.mouseAbsolute else { return }
+        prepareForMouseModeChange()
         Config.mouseAbsolute = true
         UserDefaults.standard.set(Config.mouseAbsolute, forKey: "mouseAbsolute")
+        updateMouseLocationFromSystem()
     }
 
     @objc func setMouseRelative(_ sender: Any?) {
+        guard Config.mouseAbsolute else { return }
+        prepareForMouseModeChange()
         Config.mouseAbsolute = false
         UserDefaults.standard.set(Config.mouseAbsolute, forKey: "mouseAbsolute")
+        updateMouseLocationFromSystem()
+    }
+
+    func prepareForMouseModeChange() {
+        releaseMouseButtons()
+        cancelPendingMouseMotion()
+        resetRemoteTopEdgeState()
+        toolbarReturnPosition = nil
     }
 
     @objc func setScrollNatural(_ sender: Any?) {

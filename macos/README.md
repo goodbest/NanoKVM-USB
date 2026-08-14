@@ -29,7 +29,7 @@ The Chrome-based solution (WebSerial + getUserMedia) works but uses significant 
 - **Mouse jiggler** — prevents remote machine from sleeping (30-second micro-movements)
 - **Background monitoring** — the default adaptive mode keeps the KVM window live while it is visible, including a fullscreen view on one display while you work on another. Once the window is fully covered, hidden, or minimized, it switches to low-CPU snapshots every 5 seconds for 15 minutes, every 30 seconds until 60 minutes, then every 60 seconds. Paused and fixed snapshot intervals remain available; retained inactive-window frames are visibly marked as not live.
 - **Session watchdog** — if the capture session fails to produce a frame within 3 seconds of refocusing (e.g. after long idle), it is automatically force-restarted
-- **Scoped cursor hiding** — the local cursor is hidden by default only while it is inside the rendered video area, with a fullscreen top-edge escape zone for macOS menu/toolbar access
+- **Scoped cursor hiding** — the local cursor is hidden by default only while it is inside the rendered video area. In fullscreen, remote top-edge input stays available without opening local chrome; use the small movable control near the lower-left, `Fn+Control+F2` for the macOS menu bar, or `Fn+Control+F5` for the NanoKVM toolbar.
 - **Minimal footprint** — single file, builds in seconds
 
 ## Display and Debug Notes
@@ -106,6 +106,8 @@ Uses the same CH552 serial protocol (57600 baud, `[0x57][0xAB]` framing) with co
 | Action | Shortcut |
 |--------|----------|
 | Fullscreen | `Cmd+F` |
+| Focus macOS menu bar in fullscreen | `Fn+Control+F2` |
+| Focus NanoKVM toolbar in fullscreen | `Fn+Control+F5` |
 | Quit | `Cmd+Q` |
 
 Additional key combos available from the **Keyboard** toolbar menu: Ctrl+Alt+Del, Win+Tab, Alt+F4, Ctrl+Esc, Paste, Release All Keys.
